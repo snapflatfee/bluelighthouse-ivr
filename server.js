@@ -43,12 +43,6 @@ const mailer = nodemailer.createTransport({
 app.post('/inbound', (req, res) => {
   const twiml = new VoiceResponse();
 
-  // Record the call from the start
-  twiml.record({
-    recordingStatusCallback: `${process.env.BASE_URL}/recording-status`,
-    recordingStatusCallbackMethod: 'POST',
-  });
-
   const gather = twiml.gather({
     input: 'speech dtmf',
     timeout: 5,
