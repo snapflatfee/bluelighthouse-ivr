@@ -302,8 +302,20 @@ app.post('/send-sms', async (req, res) => {
       await twilioClient.messages.create({
         from: process.env.TWILIO_PHONE_NUMBER, to: callerNumber,
         body: lang === 'es'
-          ? `Jorge Zea | Blue Lighthouse Realty\nPropiedad: ${address}, ${city}\nVendedor: ${sellerName}\n📞 ${sellerPhone}\n✉ ${sellerEmail}\n\nResponda STOP para cancelar.`
-          : `Jorge Zea | Blue Lighthouse Realty\nProperty: ${address}, ${city}\nSeller: ${sellerName}\n📞 ${sellerPhone}\n✉ ${sellerEmail}\n\nReply STOP to opt out.`,
+          ? `La informacion solicitada:
+Propiedad: ${address}, ${city}
+Vendedor: ${sellerName}
+📞 ${sellerPhone}
+✉ ${sellerEmail}
+Attn: Jorge Zea - Realtor®
+Responda STOP para cancelar.`
+          : `The info you requested:
+Property: ${address}, ${city}
+Seller: ${sellerName}
+📞 ${sellerPhone}
+✉ ${sellerEmail}
+Attn: Jorge Zea - Realtor®
+Reply STOP to opt out.`,
       });
 
       await base('CALL LOG').update(logId, { SMS_Sent: true }).catch(console.error);
@@ -406,13 +418,14 @@ async function notifySeller({ record, callerNumber, callerType, address, city })
 
   await mailer.sendMail({
     from: process.env.EMAIL_FROM, to: sellerEmail,
-    subject: `📞 Call received re: ${address}, ${city}`,
+    subject: `Lead call received. Ref: ${address}, ${city}`,
     html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
       <h2 style="color:#003087;">Call Notification — Blue Lighthouse Realty</h2>
       <p>Dear ${sellerName},</p>
-      <p>We received a call from <strong>${callerNumber}</strong> from ${callerLabel} asking about <strong>${address}, ${city}</strong>.</p>
-      <p>We provided your contact information. Feel free to follow up at: <strong>${callerNumber}</strong>.</p>
-      <br/><p>Jorge Zea<br/>Licensed Real Estate Broker<br/>Blue Lighthouse Realty | SnapFlatFee.com</p>
+      <p>A ${callerType} called asking about your property at <strong>${address}, ${city}</strong>.</p>
+      <p>Caller number: <strong>${callerNumber}</strong></p>
+      <p>Please feel free to follow up directly at your convenience.</p>
+      <br/><p>Attn: Jorge Zea at SnapFlatFee.com</p>
     </div>`,
   }).catch(console.error);
 }
