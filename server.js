@@ -39,27 +39,29 @@ function say(twiml, lang, text) {
 app.post('/inbound', (req, res) => {
   const twiml = new VoiceResponse();
 
-  say(twiml, 'en',
-    'Thank you for calling Jorge Zea, Licensed Real Estate Broker. ' +
-    'This call may be recorded for quality and compliance purposes. ' +
-    'By continuing on the line, you consent to being recorded.'
-  );
-
-  say(twiml, 'es',
-    'Gracias por llamar a Jorge Zea, Corredor de Bienes Raices Licenciado. ' +
-    'Esta llamada puede ser grabada con fines de calidad y cumplimiento. ' +
-    'Al continuar en la linea, usted consiente ser grabado.'
-  );
-
+  // All prompts inside gather so audio plays fully before input is accepted
   const gather = twiml.gather({
-    input: 'speech dtmf', numDigits: 1, timeout: 6, speechTimeout: 'auto',
+    input: 'speech dtmf', numDigits: 1, timeout: 8, speechTimeout: 'auto',
     language: 'en-US',
     hints: 'English, Spanish, espanol, one, two, uno, dos, 1, 2',
     action: `${process.env.BASE_URL}/select-language`, method: 'POST',
   });
 
-  gather.say(VOICE.en, 'For English, press 1 or say English.');
-  gather.say(VOICE.es, 'Para espanol, oprima 2 o diga espanol.');
+  // English consent + selection — Aoede
+  gather.say(VOICE.en,
+    'Thank you for calling Jorge Zea, Licensed Real Estate Broker. ' +
+    'This call may be recorded for quality and compliance purposes. ' +
+    'By continuing on the line, you consent to being recorded. ' +
+    'For English, press 1 or say English.'
+  );
+
+  // Spanish consent + selection — Zephyr
+  gather.say(VOICE.es,
+    'Gracias por llamar a Jorge Zea, Corredor de Bienes Raices Licenciado. ' +
+    'Esta llamada puede ser grabada con fines de calidad y cumplimiento. ' +
+    'Al continuar en la linea, usted consiente ser grabado. ' +
+    'Para espanol, oprima 2 o diga espanol.'
+  );
 
   twiml.redirect(`${process.env.BASE_URL}/select-language`);
   res.type('text/xml').send(twiml.toString());
