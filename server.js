@@ -49,7 +49,7 @@ app.post('/inbound', (req, res) => {
 
   // English consent + selection — Aoede
   gather.say(VOICE.en,
-    'Thank you for calling Jorge Zea, Licensed Real Estate Broker. ' +
+    'Thank you for calling Jorge Zea, Real Estate Broker. ' +
     'This call may be recorded for quality and compliance purposes. ' +
     'By continuing on the line, you consent to being recorded. ' +
     'For English, press 1 or say English.'
@@ -57,7 +57,7 @@ app.post('/inbound', (req, res) => {
 
   // Spanish consent + selection — Zephyr
   gather.say(VOICE.es,
-    'Gracias por llamar a Jorge Zea, Corredor de Bienes Raices Licenciado. ' +
+    'Gracias por llamar a Jorge Zea, Real Estate Broker. ' +
     'Esta llamada puede ser grabada con fines de calidad y cumplimiento. ' +
     'Al continuar en la linea, usted consiente ser grabado. ' +
     'Para espanol, oprima 2 o diga espanol.'
@@ -445,7 +445,7 @@ Maximum 2 sentences. Professional, warm, neutral.`;
 
   return lang === 'es'
     ? `Eres el asistente de Jorge Zea, Corredor de Bienes Raices. Responde SIEMPRE en español.\n${rules}`
-    : `You are the assistant for Jorge Zea, Licensed Real Estate Broker. Respond ONLY in English.\n${rules}`;
+    : `You are the assistant for Jorge Zea, Real Estate Broker. Respond ONLY in English.\n${rules}`;
 }
 
 const PORT = process.env.PORT || 3000;
