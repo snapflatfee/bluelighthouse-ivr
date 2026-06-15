@@ -321,23 +321,15 @@ app.post('/send-sms', async (req, res) => {
       const sellerPhone = r.get('Phone') || '';
       const sellerEmail = r.get('Email') || '';
 
+      // Build message with optional buyer ad
+      const isBuyer = callerType === 'Buyer' || callerType === 'Tenant';
+      const buyerAdEN = isBuyer ? '\n\nIf you ever need to sell your property and potentially save the entire commission, just visit: www.SnapFlatFee.com' : '';
+      const buyerAdES = isBuyer ? '\n\nSi algun dia desea vender su propiedad y potencialmente ahorrar toda la comision, visita: www.SnapFlatFee.com' : '';
+      const msgBody = lang === 'es'
+        ? ['La informacion solicitada:', 'Propiedad: ' + address + ', ' + city, 'Vendedor: ' + sellerName, 'Tel: ' + sellerPhone, 'Email: ' + sellerEmail, 'Attn: Jorge Zea - Realtor' + buyerAdES, 'Responda STOP para cancelar.'].join('\n')
+        : ['The info you requested:', 'Property: ' + address + ', ' + city, 'Seller: ' + sellerName, 'Phone: ' + sellerPhone, 'Email: ' + sellerEmail, 'Attn: Jorge Zea - Realtor' + buyerAdEN, 'Reply STOP to opt out. Msg & data rates may apply.'].join('\n');
       await twilioClient.messages.create({
-        from: process.env.TWILIO_PHONE_NUMBER, to: callerNumber,
-        body: lang === 'es'
-          ? `La informacion solicitada:
-Propiedad: ${address}, ${city}
-Vendedor: ${sellerName}
-📞 ${sellerPhone}
-✉ ${sellerEmail}
-Attn: Jorge Zea - Realtor®
-Responda STOP para cancelar.`
-          : `The info you requested:
-Property: ${address}, ${city}
-Seller: ${sellerName}
-📞 ${sellerPhone}
-✉ ${sellerEmail}
-Attn: Jorge Zea - Realtor®
-Reply STOP to opt out.`,
+        from: process.env.TWILIO_PHONE_NUMBER, to: callerNumber, body: msgBody,
       });
 
       await base('CALL LOG').update(logId, { SMS_Sent: true }).catch(console.error);
@@ -456,7 +448,7 @@ async function notifySeller({ record, callerNumber, callerType, address, city })
   const sellerEmail  = record.get('Email');
   const sellerPhone  = record.get('Phone');
   const sellerName   = record.get('Name') || 'Seller';
-  const smsConsent   = record.get('SMS') === true; // Airtable checkbox field
+  const smsConsent   = (record.get('SMS') || '').toString().toLowerCase().includes('agree (yes'); // Jotform value
   const callerLabel  = callerType === 'Realtor' ? 'a Realtor' : `a potential ${callerType.toLowerCase()}`;
 
   // Always send email to seller
