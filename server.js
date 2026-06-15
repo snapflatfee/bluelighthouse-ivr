@@ -79,8 +79,8 @@ app.post('/select-language', (req, res) => {
     input: 'speech dtmf', numDigits: 1, timeout: 6, speechTimeout: 'auto',
     language: VOICE[lang].language,
     hints: lang === 'es'
-      ? 'Realtor, agente, comprador, inquilino, uno, dos, 1, 2'
-      : 'Realtor, agent, buyer, tenant, one, two, 1, 2',
+      ? 'Realtor, agente, comprador, inquilino, otro, uno, dos, tres, 1, 2, 3'
+      : 'Realtor, agent, buyer, tenant, other, one, two, three, 1, 2, 3',
     action: `${process.env.BASE_URL}/caller-type?lang=${lang}&callSid=${callSid}`,
     method: 'POST',
   });
@@ -88,12 +88,14 @@ app.post('/select-language', (req, res) => {
   if (lang === 'es') {
     gather.say(VOICE.es,
       'Es usted un Realtor o agente de bienes raices? Oprima 1 o diga Realtor. ' +
-      'Es usted un posible comprador o inquilino? Oprima 2 o diga comprador.'
+      'Es usted un posible comprador o inquilino? Oprima 2 o diga comprador. ' +
+      'Para cualquier otra consulta, oprima 3 o diga otro.'
     );
   } else {
     gather.say(VOICE.en,
       'Are you a Realtor or real estate agent? Press 1 or say Realtor. ' +
-      'Are you an interested buyer or tenant? Press 2 or say buyer.'
+      'Are you an interested buyer or tenant? Press 2 or say buyer. ' +
+      'For anything else, press 3 or say other.'
     );
   }
 
@@ -107,10 +109,26 @@ app.post('/caller-type', (req, res) => {
   const digits     = (req.body.Digits || '').trim();
   const lang       = req.query.lang || 'en';
   const callSid    = req.query.callSid || req.body.CallSid;
+  const twiml      = new VoiceResponse();
+
+  // Option 3 — anything else → attention voicemail
+  const isOther = digits === '3' || /other|otro|else|otra|3/.test(speech);
+  if (isOther) {
+    say(twiml, lang, lang === 'es'
+      ? 'Por favor deje su mensaje despues del tono y le contactaremos a la brevedad.'
+      : 'Please leave your message after the tone and we will get back to you shortly.'
+    );
+    twiml.record({
+      maxLength: 120, transcribe: true,
+      transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=&lang=${lang}&attention=true`,
+      action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
+    });
+    return res.type('text/xml').send(twiml.toString());
+  }
+
   const isRealtor  = digits === '1' || /realtor|agent|agente|broker|1/.test(speech);
   const isTenant   = /tenant|inquilino|rent|alquil/.test(speech);
   const callerType = isRealtor ? 'Realtor' : (isTenant ? 'Tenant' : 'Buyer');
-  const twiml      = new VoiceResponse();
 
   const gather = twiml.gather({
     input: 'speech', timeout: 8, speechTimeout: 'auto',
@@ -182,7 +200,7 @@ app.post('/lookup-property', async (req, res) => {
       say(twiml, lang, lang === 'es'
         ? 'Lo sentimos, no encontramos esa propiedad. Por favor deje un mensaje.'
         : 'I\'m sorry, I couldn\'t find that property. Please leave a message and we\'ll follow up.');
-      twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=no_match&lang=${lang}&callSid=${callSid}&logId=${logId}`);
+      twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=no_match&lang=${lang}&callSid=${callSid}&logId=${logId}&attention=true`);
       return res.type('text/xml').send(twiml.toString());
     }
 
@@ -257,7 +275,9 @@ app.post('/realtor-response', async (req, res) => {
     );
   } catch (err) {
     console.error('Claude error:', err);
-    twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=ai_error&lang=${lang}&callSid=${callSid}&logId=${logId}`);
+    twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=ai_error&lang=${lang}&callSid=${callSid}&logId=${logId}&attention=true`);
+    // Also for no_match
+
   }
   res.type('text/xml').send(twiml.toString());
 });
@@ -363,6 +383,7 @@ app.post('/voicemail', (req, res) => {
   const lang         = req.query.lang || 'en';
   const matchAddress = decodeURIComponent(req.query.matchAddress || '');
   const logId        = req.query.logId || '';
+  const attention    = req.query.attention || 'false';
   const twiml        = new VoiceResponse();
   const context      = matchAddress ? (lang === 'es' ? ` Sobre: ${matchAddress}.` : ` Regarding: ${matchAddress}.`) : '';
 
@@ -373,7 +394,7 @@ app.post('/voicemail', (req, res) => {
 
   twiml.record({
     maxLength: 120, transcribe: true,
-    transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}`,
+    transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=${attention}`,
     action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
   });
   res.type('text/xml').send(twiml.toString());
@@ -389,8 +410,8 @@ app.post('/voicemail-transcribed', async (req, res) => {
   if (logId) await base('CALL LOG').update(logId, { Transcript: transcript, Voicemail_URL: recordingUrl, Call_Disposition: 'Voicemail Left' }).catch(console.error);
 
   await mailer.sendMail({
-    from: process.env.EMAIL_FROM, to: process.env.EMAIL_TO,
-    subject: `📞 New Voicemail — ${new Date().toLocaleString('en-US',{timeZone:'America/New_York'})}`,
+    from: process.env.EMAIL_FROM, to: req.query.attention === 'true' ? 'snapflatfee2@gmail.com' : process.env.EMAIL_TO,
+    subject: req.query.attention === 'true' ? 'Call from IVR - needs attention' : `📞 New Voicemail — ${new Date().toLocaleString('en-US',{timeZone:'America/New_York'})}`,
     html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
       <h2 style="color:#003087;">📞 New Voicemail — Blue Lighthouse Realty</h2>
       <p><b>Time:</b> ${new Date().toLocaleString('en-US',{timeZone:'America/New_York'})}</p>
