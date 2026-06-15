@@ -323,11 +323,11 @@ app.post('/send-sms', async (req, res) => {
 
       // Build message with optional buyer ad
       const isBuyer = callerType === 'Buyer' || callerType === 'Tenant';
-      const buyerAdEN = isBuyer ? '\n\nIf you ever need to sell your property and potentially save the entire commission, just visit: www.SnapFlatFee.com' : '';
-      const buyerAdES = isBuyer ? '\n\nSi algun dia desea vender su propiedad y potencialmente ahorrar toda la comision, visita: www.SnapFlatFee.com' : '';
+      const buyerAdEN = isBuyer ? ' If you ever need to sell your property and potentially save the entire commission, visit us at www.SnapFlatFee.com ®' : '';
+      const buyerAdES = isBuyer ? ' Para vender su propiedad y potencialmente ahorrar toda la comision visitenos en www.SnapFlatFee.com ®' : '';
       const msgBody = lang === 'es'
-        ? ['La informacion solicitada:', 'Propiedad: ' + address + ', ' + city, 'Vendedor: ' + sellerName, 'Tel: ' + sellerPhone, 'Email: ' + sellerEmail, 'Attn: Jorge Zea - Realtor' + buyerAdES, 'Responda STOP para cancelar.'].join('\n')
-        : ['The info you requested:', 'Property: ' + address + ', ' + city, 'Seller: ' + sellerName, 'Phone: ' + sellerPhone, 'Email: ' + sellerEmail, 'Attn: Jorge Zea - Realtor' + buyerAdEN, 'Reply STOP to opt out. Msg & data rates may apply.'].join('\n');
+        ? 'La informacion solicitada: Propiedad: ' + address + ', ' + city + '. Telefono: ' + sellerPhone + '. Email: ' + sellerEmail + '. Attn: Jorge Zea - Broker - Realtor®.' + buyerAdES + ' Pueden aplicar tarifas de mensajes y datos. Responda STOP para cancelar. HELP para ayuda.'
+        : 'The info you requested: Property: ' + address + ', ' + city + '. Phone: ' + sellerPhone + '. Email: ' + sellerEmail + '. Attn: Jorge Zea - Broker - Realtor®.' + buyerAdEN + ' Msg and data rates may apply. Reply STOP to opt out. HELP for help.';
       await twilioClient.messages.create({
         from: process.env.TWILIO_PHONE_NUMBER, to: callerNumber, body: msgBody,
       });
@@ -472,13 +472,7 @@ async function notifySeller({ record, callerNumber, callerType, address, city })
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
       to:   sellerPhone,
-      body: `Lead alert! SnapFlatFee.com
-${callerLabel} called about:
-${address}, ${city}
-Caller: ${callerNumber}
-Contact them directly.
-Attn: Jorge Zea
-Reply STOP to opt out.`,
+      body: `Lead alert from www.SnapFlatFee.com. We received the following call about your property: ${address}, ${city}. Caller's phone number: ${callerNumber}. Attn: Jorge Zea - Broker - Realtor® Msg and data rates may apply. Reply STOP to opt out. HELP for help.`,
     }).catch(console.error);
   }
 }
