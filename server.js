@@ -348,7 +348,7 @@ Reply STOP to opt out.`,
   }
 
   twiml.redirect(wantsShow
-    ? `${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}`
+    ? `${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}&smsSent=${wantsText}`
     : `${process.env.BASE_URL}/voicemail?lang=${lang}&logId=${logId}&reason=realtor_other`
   );
   res.type('text/xml').send(twiml.toString());
@@ -361,12 +361,31 @@ app.post('/transfer-seller', async (req, res) => {
   const logId   = req.query.logId;
   const twiml   = new VoiceResponse();
 
+  const smsSent = req.query.smsSent === 'true';
+
   try {
     const r           = await base('ALL LISTINGS').find(matchId);
     const sellerPhone = r.get('Phone') || '';
+    const listingType = (r.get('Type') || '').toLowerCase();
+    const isRental    = listingType.includes('rent') || listingType.includes('lease');
 
     if (sellerPhone) {
-      say(twiml, lang, lang === 'es' ? 'Le transfiero ahora con el vendedor. Un momento por favor.' : 'Transferring you to the seller now. One moment please.');
+      // Handover message — varies by sale vs rental + whether SMS was sent
+      if (lang === 'es') {
+        const party    = isRental ? 'el propietario' : 'el vendedor';
+        const smsPart  = smsSent ? ' Por favor revise sus mensajes de texto tambien.' : '';
+        say(twiml, 'es',
+          `Le transferimos ahora con ${party}. ${isRental ? 'El propietario' : 'El vendedor'} coordina las visitas directamente y puede proveerle informacion adicional.${smsPart} Un momento por favor.`
+        );
+      } else {
+        const party    = isRental ? 'the landlord' : 'the seller';
+        const Party    = isRental ? 'The landlord' : 'The seller';
+        const smsPart  = smsSent ? ' Please check your text messages as well.' : '';
+        say(twiml, 'en',
+          `We are now transferring your call to ${party}. ${Party} is coordinating showings directly and can provide additional information.${smsPart} One moment please.`
+        );
+      }
+
       twiml.dial(sellerPhone);
       await base('CALL LOG').update(logId, { Call_Disposition: 'Transferred to Seller', Seller_Notified: true }).catch(console.error);
     } else {
@@ -434,23 +453,42 @@ app.post('/voicemail-done', (req, res) => {
 });
 
 async function notifySeller({ record, callerNumber, callerType, address, city }) {
-  const sellerEmail = record.get('Email');
-  if (!sellerEmail) return;
-  const sellerName  = record.get('Name') || 'Seller';
-  const callerLabel = callerType === 'Realtor' ? 'a Realtor' : `a potential ${callerType.toLowerCase()}`;
+  const sellerEmail  = record.get('Email');
+  const sellerPhone  = record.get('Phone');
+  const sellerName   = record.get('Name') || 'Seller';
+  const smsConsent   = record.get('SMS') === true; // Airtable checkbox field
+  const callerLabel  = callerType === 'Realtor' ? 'a Realtor' : `a potential ${callerType.toLowerCase()}`;
 
-  await mailer.sendMail({
-    from: process.env.EMAIL_FROM, to: sellerEmail,
-    subject: `Lead call received. Ref: ${address}, ${city}`,
-    html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
-      <h2 style="color:#003087;">Call Notification — Blue Lighthouse Realty</h2>
-      <p>Dear ${sellerName},</p>
-      <p>A ${callerType} called asking about your property at <strong>${address}, ${city}</strong>.</p>
-      <p>Caller number: <strong>${callerNumber}</strong></p>
-      <p>Please feel free to follow up directly at your convenience.</p>
-      <br/><p>Attn: Jorge Zea at SnapFlatFee.com</p>
-    </div>`,
-  }).catch(console.error);
+  // Always send email to seller
+  if (sellerEmail) {
+    await mailer.sendMail({
+      from: process.env.EMAIL_FROM, to: sellerEmail,
+      subject: `Lead call received. Ref: ${address}, ${city}`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
+        <h2 style="color:#003087;">Call Notification — Blue Lighthouse Realty</h2>
+        <p>Dear ${sellerName},</p>
+        <p>A ${callerLabel} called asking about your property at <strong>${address}, ${city}</strong>.</p>
+        <p>Caller number: <strong>${callerNumber}</strong></p>
+        <p>Please feel free to follow up directly at your convenience.</p>
+        <br/><p>Attn: Jorge Zea at SnapFlatFee.com</p>
+      </div>`,
+    }).catch(console.error);
+  }
+
+  // SMS to seller only if they consented via form (SMS checkbox = true)
+  if (sellerPhone && smsConsent) {
+    await twilioClient.messages.create({
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to:   sellerPhone,
+      body: `Lead alert! SnapFlatFee.com
+${callerLabel} called about:
+${address}, ${city}
+Caller: ${callerNumber}
+Contact them directly.
+Attn: Jorge Zea
+Reply STOP to opt out.`,
+    }).catch(console.error);
+  }
 }
 
 function buildRealtorSystemPrompt(lang, listingContext) {
