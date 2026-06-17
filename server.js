@@ -346,14 +346,13 @@ app.post('/send-sms', async (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// TRANSFER TO SELLER
+// TRANSFER TO SELLER — with 2nd leg recording + seller whisper consent
 app.post('/transfer-seller', async (req, res) => {
   const lang    = req.query.lang || 'en';
   const matchId = decodeURIComponent(req.query.matchId || '');
   const logId   = req.query.logId;
-  const twiml   = new VoiceResponse();
-
   const smsSent = req.query.smsSent === 'true';
+  const twiml   = new VoiceResponse();
 
   try {
     const r           = await base('ALL LISTINGS').find(matchId);
@@ -362,24 +361,42 @@ app.post('/transfer-seller', async (req, res) => {
     const isRental    = listingType.includes('rent') || listingType.includes('lease');
 
     if (sellerPhone) {
-      // Handover message — varies by sale vs rental + whether SMS was sent
+      // Handover message to caller
       if (lang === 'es') {
-        const party    = isRental ? 'el propietario' : 'el vendedor';
-        const smsPart  = smsSent ? ' Por favor revise sus mensajes de texto tambien.' : '';
+        const party   = isRental ? 'el propietario' : 'el vendedor';
+        const Party   = isRental ? 'El propietario' : 'El vendedor';
+        const smsPart = smsSent ? ' Por favor revise sus mensajes de texto tambien.' : '';
         say(twiml, 'es',
-          `Le transferimos ahora con ${party}. ${isRental ? 'El propietario' : 'El vendedor'} coordina las visitas directamente y puede proveerle informacion adicional.${smsPart} Un momento por favor.`
+          `Le transferimos ahora con ${party}. ${Party} coordina las visitas directamente y puede proveerle informacion adicional.${smsPart} Un momento por favor.`
         );
       } else {
-        const party    = isRental ? 'the landlord' : 'the seller';
-        const Party    = isRental ? 'The landlord' : 'The seller';
-        const smsPart  = smsSent ? ' Please check your text messages as well.' : '';
+        const party   = isRental ? 'the landlord' : 'the seller';
+        const Party   = isRental ? 'The landlord' : 'The seller';
+        const smsPart = smsSent ? ' Please check your text messages as well.' : '';
         say(twiml, 'en',
           `We are now transferring your call to ${party}. ${Party} is coordinating showings directly and can provide additional information.${smsPart} One moment please.`
         );
       }
 
-      twiml.dial(sellerPhone);
-      await base('CALL LOG').update(logId, { Call_Disposition: 'Transferred to Seller', Seller_Notified: true }).catch(console.error);
+      // Dial with 2nd leg recording + seller whisper for consent
+      const dial = twiml.dial({
+        record: 'record-from-answer-dual-channel',
+        recordingStatusCallback: `${process.env.BASE_URL}/second-leg-recording?logId=${logId}`,
+        recordingStatusCallbackMethod: 'POST',
+      });
+
+      dial.number({
+        url: `${process.env.BASE_URL}/seller-whisper?lang=${lang}&isRental=${isRental}`,
+        statusCallback: `${process.env.BASE_URL}/seller-status?logId=${logId}`,
+        statusCallbackMethod: 'POST',
+        statusCallbackEvent: 'answered completed',
+      }, sellerPhone);
+
+      await base('CALL LOG').update(logId, {
+        Call_Disposition: 'Transferred to Seller',
+        Seller_Notified: true,
+      }).catch(console.error);
+
     } else {
       twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=no_seller_phone&lang=${lang}&logId=${logId}`);
     }
@@ -387,6 +404,101 @@ app.post('/transfer-seller', async (req, res) => {
     twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=transfer_error&lang=${lang}&logId=${logId}`);
   }
   res.type('text/xml').send(twiml.toString());
+});
+
+// SELLER WHISPER — plays to seller only before connecting, captures consent
+app.post('/seller-whisper', (req, res) => {
+  const lang     = req.query.lang || 'en';
+  const isRental = req.query.isRental === 'true';
+  const twiml    = new VoiceResponse();
+
+  const gather = twiml.gather({
+    input: 'speech dtmf',
+    numDigits: 1,
+    timeout: 8,
+    speechTimeout: 'auto',
+    language: VOICE[lang].language,
+    hints: lang === 'es' ? 'si, aceptar, ok, 1' : 'yes, accept, ok, 1',
+    action: `${process.env.BASE_URL}/seller-consent?lang=${lang}`,
+    method: 'POST',
+  });
+
+  if (lang === 'es') {
+    const party = isRental ? 'su inquilino potencial' : 'un posible comprador o Realtor';
+    gather.say(VOICE.es,
+      `Tiene una llamada entrante de SnapFlatFee.com sobre su propiedad. ` +
+      `Se conectara con ${party}. ` +
+      `Esta llamada sera grabada con fines de calidad y cumplimiento. ` +
+      `Diga OK o oprima 1 para aceptar y conectarse.`
+    );
+  } else {
+    const party = isRental ? 'a potential tenant' : 'a potential buyer or Realtor';
+    gather.say(VOICE.en,
+      `You have an incoming call from SnapFlatFee.com regarding your listing. ` +
+      `You will be connected with ${party}. ` +
+      `This call will be recorded for quality and compliance purposes. ` +
+      `Say OK or press 1 to accept and connect.`
+    );
+  }
+
+  // If no response — hang up gracefully
+  say(twiml, lang, lang === 'es'
+    ? 'No recibimos respuesta. La llamada sera enviada al buzon de voz.'
+    : 'No response received. The call will be sent to voicemail.'
+  );
+  twiml.hangup();
+
+  res.type('text/xml').send(twiml.toString());
+});
+
+// SELLER CONSENT — confirmed, connect the call
+app.post('/seller-consent', (req, res) => {
+  const speech = (req.body.SpeechResult || '').toLowerCase();
+  const digits = (req.body.Digits || '').trim();
+  const lang   = req.query.lang || 'en';
+  const twiml  = new VoiceResponse();
+
+  const accepted = digits === '1' || /yes|ok|si|sí|aceptar|accept/.test(speech);
+
+  if (accepted) {
+    // Empty response = connect the call
+    res.type('text/xml').send('<Response></Response>');
+  } else {
+    say(twiml, lang, lang === 'es'
+      ? 'Llamada no aceptada. Gracias.'
+      : 'Call not accepted. Thank you.'
+    );
+    twiml.hangup();
+    res.type('text/xml').send(twiml.toString());
+  }
+});
+
+// SECOND LEG RECORDING STATUS — saves recording URL to Airtable
+app.post('/second-leg-recording', async (req, res) => {
+  const recordingUrl = req.body.RecordingUrl || '';
+  const duration     = req.body.RecordingDuration || 0;
+  const logId        = req.query.logId || '';
+
+  if (logId && recordingUrl) {
+    await base('CALL LOG').update(logId, {
+      Second_Leg_Recording_URL: recordingUrl,
+    }).catch(console.error);
+  }
+  res.sendStatus(200);
+});
+
+// SELLER STATUS — tracks if seller answered or declined
+app.post('/seller-status', async (req, res) => {
+  const callStatus = req.body.CallStatus || '';
+  const logId      = req.query.logId || '';
+
+  if (logId) {
+    const answered = callStatus === 'completed' || callStatus === 'answered';
+    await base('CALL LOG').update(logId, {
+      Seller_Accepted_Call: answered,
+    }).catch(console.error);
+  }
+  res.sendStatus(200);
 });
 
 // VOICEMAIL
