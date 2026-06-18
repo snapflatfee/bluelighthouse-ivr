@@ -276,6 +276,22 @@
     flex-shrink: 0;
   }
 
+  .conv-delete {
+    opacity: 0;
+    background: none;
+    border: none;
+    color: var(--red);
+    font-size: 15px;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: 6px;
+    flex-shrink: 0;
+    transition: opacity 0.15s, background 0.15s;
+  }
+
+  .conv-item:hover .conv-delete { opacity: 1; }
+  .conv-delete:hover { background: #FDE8E6; }
+
   /* ── Chat Area ── */
   .chat-area {
     flex: 1;
@@ -663,8 +679,6 @@
         </div>
       </div>
       <div class="chat-actions">
-        <button class="btn-icon" onclick="refreshMessages()">🔄 Refresh</button>
-        <button class="btn-icon" id="callBtn">📞 Call</button>
       </div>
     </div>
 
@@ -801,19 +815,48 @@ function renderDemoData() {
   renderConversationList(conversations);
 }
 
+function getHiddenConversations() {
+  try { return JSON.parse(localStorage.getItem('hiddenConvs') || '[]'); }
+  catch (e) { return []; }
+}
+
+function hideConversation(number, event) {
+  event.stopPropagation();
+  if (!confirm('Remove this conversation from your list? The messages stay in Twilio, this just hides it from view.')) return;
+  const hidden = getHiddenConversations();
+  if (!hidden.includes(number)) {
+    hidden.push(number);
+    localStorage.setItem('hiddenConvs', JSON.stringify(hidden));
+  }
+  if (activeConversation && activeConversation.number === number) {
+    activeConversation = null;
+    document.getElementById('emptyState').style.display = 'flex';
+    document.getElementById('chatHeader').style.display = 'none';
+    document.getElementById('contextBar').style.display = 'none';
+    document.getElementById('messagesContainer').style.display = 'none';
+    document.getElementById('composer').style.display = 'none';
+  }
+  renderConversationList(conversations);
+  showToast('Conversation removed', 'success');
+}
+
 function renderConversationList(list) {
   const el = document.getElementById('conversationList');
-  if (!list.length) {
+  const hidden = getHiddenConversations();
+  const visible = list.filter(c => !hidden.includes(c.number));
+
+  if (!visible.length) {
     el.innerHTML = '<div style="padding:24px;text-align:center;color:var(--muted);font-size:13px;">No conversations yet.<br/>Calls will appear here after SMS is sent.</div>';
     return;
   }
 
-  el.innerHTML = list.map(c => {
+  el.innerHTML = visible.map(c => {
     const initials = getInitials(c.number, c.type);
     const avatarClass = 'conv-avatar ' + (c.type || 'unknown').toLowerCase();
     const tagClass = 'tag tag-' + (c.type || 'unknown').toLowerCase();
     const timeStr = formatTime(c.lastTime);
     const isActive = activeConversation && activeConversation.number === c.number;
+    const safeNum = c.number.replace(/'/g, "\\'");
 
     return `
       <div class="conv-item ${isActive ? 'active' : ''}" onclick="selectConversation(${JSON.stringify(c).replace(/"/g, '&quot;')})">
@@ -830,6 +873,7 @@ function renderConversationList(list) {
           </div>
         </div>
         ${c.unread ? '<div class="unread-dot"></div>' : ''}
+        <button class="conv-delete" onclick="hideConversation('${safeNum}', event)" title="Remove from list">🗑</button>
       </div>
     `;
   }).join('');
@@ -850,11 +894,6 @@ async function selectConversation(conv) {
   document.getElementById('chatAvatar').className = 'chat-avatar conv-avatar ' + (conv.type || 'unknown').toLowerCase();
   document.getElementById('chatName').textContent = conv.number;
   document.getElementById('chatNumber').textContent = conv.type || 'Unknown';
-
-  // Set call button
-  document.getElementById('callBtn').onclick = () => {
-    window.open(`tel:${conv.number}`);
-  };
 
   // Property context
   if (conv.property) {
@@ -948,6 +987,7 @@ async function sendMessage() {
     input.value = '';
     input.style.height = 'auto';
     await loadMessages(activeConversation.number);
+    await loadConversations();
     showToast('Message sent ✓', 'success');
   } catch (err) {
     showToast('Failed to send message', 'error');
