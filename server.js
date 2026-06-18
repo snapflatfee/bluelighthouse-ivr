@@ -22,6 +22,35 @@ app.get('/dashboard', (req, res) => {
   res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
+// ─── INBOUND SMS — replies from callers/sellers ──────────────────────────────
+app.post('/sms-inbound', async (req, res) => {
+  const from = req.body.From || '';
+  const body = req.body.Body || '';
+
+  console.log(`Inbound SMS from ${from}: ${body}`);
+
+  // Log to CALL LOG if a recent record exists for this number, else just log to console
+  try {
+    const records = await base('CALL LOG').select({
+      filterByFormula: `{Caller_Number} = '${from}'`,
+      sort: [{ field: 'Call_Date', direction: 'desc' }],
+      maxRecords: 1,
+    }).firstPage();
+
+    if (records.length > 0) {
+      const existing = records[0].get('Notes') || '';
+      await base('CALL LOG').update(records[0].id, {
+        Notes: existing + `\n[SMS REPLY ${new Date().toLocaleString('en-US',{timeZone:'America/New_York'})}]: ${body}`,
+      }).catch(console.error);
+    }
+  } catch (err) {
+    console.error('SMS inbound log error:', err);
+  }
+
+  // No auto-reply — message just gets logged and appears in /dashboard
+  res.type('text/xml').send('<Response></Response>');
+});
+
 // ─── API: Get all conversations (unique numbers from CALL LOG) ───────────────
 app.get('/api/conversations', async (req, res) => {
   try {
