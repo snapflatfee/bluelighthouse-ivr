@@ -15,6 +15,99 @@ require('dotenv').config();
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+const path = require('path');
+
+// ─── Dashboard UI ────────────────────────────────────────────────────────────
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dashboard.html'));
+});
+
+// ─── API: Get all conversations (unique numbers from CALL LOG) ───────────────
+app.get('/api/conversations', async (req, res) => {
+  try {
+    const records = await base('CALL LOG').select({
+      sort: [{ field: 'Call_Date', direction: 'desc' }],
+      maxRecords: 200,
+      fields: ['Call_Date','Caller_Number','Caller_Type','Language',
+               'Real_Address','Property_Address','Transcript','SMS_Sent'],
+    }).all();
+
+    // Group by caller number — one entry per unique number
+    const seen = new Map();
+    records.forEach(r => {
+      const num = r.get('Caller_Number') || '';
+      if (!num) return;
+      if (!seen.has(num)) {
+        seen.set(num, {
+          number:      num,
+          type:        r.get('Caller_Type') || 'unknown',
+          property:    r.get('Real_Address') || r.get('Property_Address') || '',
+          lastMessage: r.get('Transcript') ? r.get('Transcript').slice(0, 80) : 'Call received',
+          lastTime:    r.get('Call_Date') || new Date().toISOString(),
+          unread:      false,
+        });
+      }
+    });
+
+    res.json({ conversations: Array.from(seen.values()) });
+  } catch (err) {
+    console.error('Conversations API error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── API: Get messages for a specific number (Twilio) ───────────────────────
+app.get('/api/messages', async (req, res) => {
+  try {
+    const number = req.query.number;
+    if (!number) return res.status(400).json({ error: 'number required' });
+
+    const messages = await twilioClient.messages.list({
+      to:   number,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      limit: 50,
+    });
+
+    const inbound = await twilioClient.messages.list({
+      from: number,
+      to:   process.env.TWILIO_PHONE_NUMBER,
+      limit: 50,
+    });
+
+    const all = [...messages, ...inbound]
+      .sort((a, b) => new Date(a.dateSent) - new Date(b.dateSent));
+
+    res.json({ messages: all.map(m => ({
+      sid:       m.sid,
+      direction: m.direction,
+      body:      m.body,
+      dateSent:  m.dateSent,
+      status:    m.status,
+    }))});
+  } catch (err) {
+    console.error('Messages API error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── API: Send a message ─────────────────────────────────────────────────────
+app.post('/api/send', async (req, res) => {
+  try {
+    const { to, body } = req.body;
+    if (!to || !body) return res.status(400).json({ error: 'to and body required' });
+
+    const msg = await twilioClient.messages.create({
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to,
+      body,
+    });
+
+    res.json({ success: true, sid: msg.sid });
+  } catch (err) {
+    console.error('Send API error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const twilioClient  = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const VoiceResponse = twilio.twiml.VoiceResponse;
