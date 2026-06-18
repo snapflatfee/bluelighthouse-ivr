@@ -51,38 +51,71 @@ app.post('/sms-inbound', async (req, res) => {
   res.type('text/xml').send('<Response></Response>');
 });
 
-// ─── API: Get all conversations (unique numbers from CALL LOG) ───────────────
+// ─── API: Get all conversations (from Twilio message history + CALL LOG context) ──
 app.get('/api/conversations', async (req, res) => {
   try {
+    // 1. Pull ALL real conversations from Twilio (both directions)
+    const sent = await twilioClient.messages.list({ from: process.env.TWILIO_PHONE_NUMBER, limit: 200 });
+    const received = await twilioClient.messages.list({ to: process.env.TWILIO_PHONE_NUMBER, limit: 200 });
+    const allMsgs = [...sent, ...received];
+
+    // 2. Pull CALL LOG for context (caller type, property) — best-effort match
     const records = await base('CALL LOG').select({
       sort: [{ field: 'Call_Date', direction: 'desc' }],
-      maxRecords: 200,
-      fields: ['Call_Date','Caller_Number','Caller_Type','Language',
-               'Real_Address','Property_Address','Transcript','SMS_Sent'],
+      maxRecords: 300,
+      fields: ['Call_Date','Caller_Number','Caller_Type','Real_Address','Property_Address'],
     }).all();
 
-    // Group by caller number — one entry per unique number
-    const seen = new Map();
+    const contextByNumber = new Map();
     records.forEach(r => {
       const num = r.get('Caller_Number') || '';
-      if (!num) return;
-      if (!seen.has(num)) {
-        seen.set(num, {
-          number:      num,
-          type:        r.get('Caller_Type') || 'unknown',
-          property:    r.get('Real_Address') || r.get('Property_Address') || '',
-          lastMessage: r.get('Transcript') ? r.get('Transcript').slice(0, 80) : 'Call received',
-          lastTime:    r.get('Call_Date') || new Date().toISOString(),
+      if (num && !contextByNumber.has(num)) {
+        contextByNumber.set(num, {
+          type:     r.get('Caller_Type') || 'unknown',
+          property: r.get('Real_Address') || r.get('Property_Address') || '',
+        });
+      }
+    });
+
+    // 3. Build conversation list keyed by the OTHER party's number
+    const convMap = new Map();
+    allMsgs.forEach(m => {
+      const isOutbound = m.direction && m.direction.startsWith('outbound');
+      const otherNumber = isOutbound ? m.to : m.from;
+      if (!otherNumber || otherNumber === process.env.TWILIO_PHONE_NUMBER) return;
+
+      const existing = convMap.get(otherNumber);
+      const msgTime = new Date(m.dateSent || m.dateCreated);
+
+      if (!existing || msgTime > new Date(existing.lastTime)) {
+        const ctx = contextByNumber.get(otherNumber) || {};
+        convMap.set(otherNumber, {
+          number:      otherNumber,
+          type:        ctx.type || 'unknown',
+          property:    ctx.property || '',
+          lastMessage: (m.body || '').slice(0, 80),
+          lastTime:    msgTime.toISOString(),
           unread:      false,
         });
       }
     });
 
-    res.json({ conversations: Array.from(seen.values()) });
+    const conversations = Array.from(convMap.values())
+      .sort((a, b) => new Date(b.lastTime) - new Date(a.lastTime));
+
+    res.json({ conversations });
   } catch (err) {
     console.error('Conversations API error:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── API: Delete (hide) a conversation thread ────────────────────────────────
+// Note: Twilio does not support deleting message history via this approach in
+// a way that removes it from the carrier record. This endpoint is a no-op
+// placeholder; actual hiding is handled client-side via localStorage.
+app.post('/api/hide-conversation', (req, res) => {
+  res.json({ success: true });
 });
 
 // ─── API: Get messages for a specific number (Twilio) ───────────────────────
