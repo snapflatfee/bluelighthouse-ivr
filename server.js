@@ -190,9 +190,40 @@ function say(twiml, lang, text) {
   twiml.say(VOICE[lang], text);
 }
 
+// ─── Business Hours Check (7:00 AM – 9:00 PM Eastern, every day) ────────────
+function isWithinBusinessHours() {
+  const now = new Date();
+  const etHour = parseInt(now.toLocaleString('en-US', {
+    timeZone: 'America/New_York', hour: '2-digit', hour12: false,
+  }));
+  return etHour >= 7 && etHour < 21; // 7:00 AM through 8:59:59 PM
+}
+
 // STEP 1 — INBOUND: FL two-party consent + dual-language greeting
 app.post('/inbound', (req, res) => {
   const twiml = new VoiceResponse();
+
+  // After-hours check — bypass entire IVR and go straight to bilingual voicemail
+  if (!isWithinBusinessHours()) {
+    say(twiml, 'en',
+      'Thank you for calling Jorge Zea, Real Estate Broker. ' +
+      'Unfortunately you reached us outside of our working schedule, ' +
+      'which is from 7 AM to 9 PM every day. Please leave us a message ' +
+      'with the property address you are calling about after the tone.'
+    );
+    say(twiml, 'es',
+      'Gracias por llamar a Jorge Zea, Real Estate Broker. ' +
+      'Desafortunadamente estamos fuera de nuestro horario de atencion ' +
+      'de 7 AM a 9 PM todos los dias. Por favor deje un mensaje con la ' +
+      'direccion de la propiedad despues del tono.'
+    );
+    twiml.record({
+      maxLength: 120, transcribe: true,
+      transcribeCallback: `${process.env.BASE_URL}/afterhours-transcribed`,
+      action: `${process.env.BASE_URL}/voicemail-done?lang=en`, method: 'POST',
+    });
+    return res.type('text/xml').send(twiml.toString());
+  }
 
   // All prompts inside gather so audio plays fully before input is accepted
   const gather = twiml.gather({
@@ -366,9 +397,10 @@ app.post('/lookup-property', async (req, res) => {
   const twiml         = new VoiceResponse();
 
   try {
+    // Search ALL listings regardless of status so we can distinguish
+    // "no such property" from "property exists but is no longer available"
     const records = await base('ALL LISTINGS').select({
-      filterByFormula: `OR({Status}='Active',{Status}='Coming Soon')`,
-      fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email','BAC Offered','Commission NOTES','Type','List Price','Notes','prop_id'],
+      fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email','BAC Offered','Commission NOTES','Type','List Price','Notes','prop_id','Status'],
     }).all();
 
     const listings = records.map(r => ({
@@ -379,6 +411,7 @@ app.post('/lookup-property', async (req, res) => {
       name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
       bac: r.get('BAC Offered') || '', commNotes: r.get('Commission NOTES') || '',
       type: r.get('Type') || '', price: r.get('List Price') || '', notes: r.get('Notes') || '',
+      status: r.get('Status') || '',
     }));
 
     const fuse    = new Fuse(listings, { keys: ['address','fullAddress','city'], threshold: 0.45, includeScore: true });
@@ -409,6 +442,23 @@ app.post('/lookup-property', async (req, res) => {
         ? 'Lo sentimos, no encontramos esa propiedad. Por favor deje un mensaje.'
         : 'I\'m sorry, I couldn\'t find that property. Please leave a message and we\'ll follow up.');
       twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=no_match&lang=${lang}&callSid=${callSid}&logId=${logId}&attention=true`);
+      return res.type('text/xml').send(twiml.toString());
+    }
+
+    // Status filter — only Active or Pending listings proceed to full flow
+    const statusOk = /^active$|^pending$/i.test((match.status || '').trim());
+    if (!statusOk) {
+      await base('CALL LOG').update(logId, { Call_Disposition: 'No Match Found', Notes: `Property found but Status = "${match.status}" (not Active/Pending)` }).catch(console.error);
+
+      say(twiml, lang, lang === 'es'
+        ? 'Desafortunadamente esta propiedad ya no se encuentra disponible. Si desea dejar un mensaje, por favor hagalo despues del tono.'
+        : 'Unfortunately this property is no longer available. If you want, you may leave a message after the tone.'
+      );
+      twiml.record({
+        maxLength: 120, transcribe: true,
+        transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=true`,
+        action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
+      });
       return res.type('text/xml').send(twiml.toString());
     }
 
@@ -762,6 +812,95 @@ app.post('/voicemail-done', (req, res) => {
   say(twiml, lang, lang === 'es' ? 'Gracias. Hasta pronto.' : 'Thank you. Goodbye.');
   twiml.hangup();
   res.type('text/xml').send(twiml.toString());
+});
+
+// ─── AFTER-HOURS VOICEMAIL TRANSCRIBED ───────────────────────────────────────
+// Tries to detect a property address from the transcript. If found, emails
+// the seller only (no SMS, per after-hours policy). If not found, routes
+// the lead to your attention inbox instead.
+app.post('/afterhours-transcribed', async (req, res) => {
+  const transcript   = req.body.TranscriptionText || '';
+  const recordingUrl = req.body.RecordingUrl || '';
+  const callSid      = req.body.CallSid || '';
+  const callerNumber = req.body.From || '';
+
+  try {
+    const records = await base('ALL LISTINGS').select({
+      filterByFormula: `OR({Status}='Active',{Status}='Pending',{Status}='Coming Soon')`,
+      fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email'],
+    }).all();
+
+    const listings = records.map(r => ({
+      id: r.id,
+      address: r.get('Address') || r.get('Street Address') || '',
+      city: r.get('City') || '',
+      fullAddress: [r.get('Address') || r.get('Street Address'), r.get('City'), r.get('State'), r.get('Zip code')].filter(Boolean).join(', '),
+      name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
+    }));
+
+    const fuse = new Fuse(listings, { keys: ['address','fullAddress','city'], threshold: 0.45, includeScore: true });
+    const results = fuse.search(transcript);
+    const match = results.length > 0 ? results[0].item : null;
+
+    // Log to CALL LOG regardless of match
+    const logRecord = await base('CALL LOG').create({
+      Name: `After-Hours Call ${new Date().toISOString()}`,
+      Call_ID: callSid,
+      Call_Date: new Date().toISOString(),
+      Caller_Number: callerNumber,
+      Caller_Type: 'Unknown',
+      Property_Address: transcript,
+      Transcript: transcript,
+      Voicemail_URL: recordingUrl,
+      Call_Disposition: match ? 'Voicemail Left' : 'No Match Found',
+      Real_Address: match ? match.fullAddress : '',
+      Listing_Link: match ? [{ id: match.id }] : undefined,
+    }).catch(err => { console.error('After-hours log error:', err); return null; });
+
+    if (match && match.email) {
+      // Email seller only — no SMS for after-hours leads
+      await mailer.sendMail({
+        from: process.env.EMAIL_FROM, to: match.email,
+        subject: `Lead call received after hours. Ref: ${match.fullAddress}`,
+        html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
+          <h2 style="color:#003087;">Call Notification — Blue Lighthouse Realty</h2>
+          <p>Dear ${match.name || 'Seller'},</p>
+          <p>We received an after-hours call about your property at <strong>${match.fullAddress}</strong>.</p>
+          <p>Caller number: <strong>${callerNumber}</strong></p>
+          <p><i>Received after hours.</i></p>
+          <h3>Voicemail Transcript</h3>
+          <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript}</p>
+          <br/><p>Attn: Jorge Zea at SnapFlatFee.com</p>
+        </div>`,
+      }).catch(console.error);
+    } else {
+      // No address match — route to attention inbox
+      await mailer.sendMail({
+        from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
+        subject: 'IVR - After hours call',
+        html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
+          <h2 style="color:#003087;">📞 After-Hours Voicemail — No Property Match</h2>
+          <p><b>Time:</b> ${new Date().toLocaleString('en-US',{timeZone:'America/New_York'})}</p>
+          <p><b>Caller:</b> ${callerNumber}</p>
+          <p><b>Recording:</b> <a href="${recordingUrl}">Listen</a></p>
+          <h3>Transcript</h3>
+          <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript || 'Pending...'}</p>
+        </div>`,
+      }).catch(console.error);
+    }
+  } catch (err) {
+    console.error('After-hours processing error:', err);
+    await mailer.sendMail({
+      from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
+      subject: 'IVR - After hours call',
+      html: `<p>After-hours voicemail received. Error processing address match.</p>
+        <p>Caller: ${callerNumber}</p>
+        <p>Recording: <a href="${recordingUrl}">Listen</a></p>
+        <p>Transcript: ${transcript}</p>`,
+    }).catch(console.error);
+  }
+
+  res.sendStatus(200);
 });
 
 async function notifySeller({ record, callerNumber, callerType, address, city }) {
