@@ -292,6 +292,20 @@
   .conv-item:hover .conv-delete { opacity: 1; }
   .conv-delete:hover { background: #FDE8E6; }
 
+  .unread-name {
+    font-weight: 800;
+    color: var(--navy);
+  }
+
+  .unread-preview {
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .conv-item.has-unread {
+    background: #F4F8FE;
+  }
+
   /* ── Chat Area ── */
   .chat-area {
     flex: 1;
@@ -840,6 +854,26 @@ function hideConversation(number, event) {
   showToast('Conversation removed', 'success');
 }
 
+function getLastViewed() {
+  try { return JSON.parse(localStorage.getItem('lastViewed') || '{}'); }
+  catch (e) { return {}; }
+}
+
+function markAsViewed(number, timestamp) {
+  const lastViewed = getLastViewed();
+  lastViewed[number] = timestamp || new Date().toISOString();
+  localStorage.setItem('lastViewed', JSON.stringify(lastViewed));
+}
+
+function isUnread(conv) {
+  // Only inbound-most-recent messages count as "unread" — if the last
+  // message in the thread was sent BY you, there's nothing new to read.
+  const lastViewed = getLastViewed();
+  const viewedAt = lastViewed[conv.number];
+  if (!viewedAt) return true; // never opened this thread
+  return new Date(conv.lastTime) > new Date(viewedAt);
+}
+
 function renderConversationList(list) {
   const el = document.getElementById('conversationList');
   const hidden = getHiddenConversations();
@@ -857,22 +891,23 @@ function renderConversationList(list) {
     const timeStr = formatTime(c.lastTime);
     const isActive = activeConversation && activeConversation.number === c.number;
     const safeNum = c.number.replace(/'/g, "\\'");
+    const unread = !isActive && isUnread(c);
 
     return `
-      <div class="conv-item ${isActive ? 'active' : ''}" onclick="selectConversation(${JSON.stringify(c).replace(/"/g, '&quot;')})">
+      <div class="conv-item ${isActive ? 'active' : ''} ${unread ? 'has-unread' : ''}" onclick="selectConversation(${JSON.stringify(c).replace(/"/g, '&quot;')})">
         <div class="${avatarClass}">${initials}</div>
         <div class="conv-info">
           <div class="conv-top">
-            <div class="conv-name">${c.number}</div>
+            <div class="conv-name ${unread ? 'unread-name' : ''}">${c.number}</div>
             <div class="conv-time">${timeStr}</div>
           </div>
-          <div class="conv-preview">${escHtml(c.lastMessage || '')}</div>
+          <div class="conv-preview ${unread ? 'unread-preview' : ''}">${escHtml(c.lastMessage || '')}</div>
           <div class="conv-tags">
             ${c.type ? `<span class="${tagClass}">${c.type}</span>` : ''}
             ${c.property ? `<span style="font-size:10px;color:var(--muted);">📍 ${escHtml(c.property)}</span>` : ''}
           </div>
         </div>
-        ${c.unread ? '<div class="unread-dot"></div>' : ''}
+        ${unread ? '<div class="unread-dot"></div>' : ''}
         <button class="conv-delete" onclick="hideConversation('${safeNum}', event)" title="Remove from list">🗑</button>
       </div>
     `;
@@ -882,6 +917,7 @@ function renderConversationList(list) {
 // ── Select Conversation ──────────────────────────────────────────────────────
 async function selectConversation(conv) {
   activeConversation = conv;
+  markAsViewed(conv.number, conv.lastTime);
 
   // Update UI
   document.getElementById('emptyState').style.display = 'none';
@@ -923,6 +959,11 @@ async function loadMessages(number) {
   try {
     const data = await apiGet(`/api/messages?number=${encodeURIComponent(number)}`);
     renderMessages(data.messages || [], container);
+    // Keep this thread marked as read while it's open, even if new
+    // messages arrive via polling — only the open thread auto-clears.
+    if (activeConversation && activeConversation.number === number) {
+      markAsViewed(number);
+    }
   } catch (err) {
     // Demo messages
     renderMessages([
