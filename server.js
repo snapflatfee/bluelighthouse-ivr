@@ -285,6 +285,59 @@ app.post('/caller-type', (req, res) => {
   const isTenant   = /tenant|inquilino|rent|alquil/.test(speech);
   const callerType = isRealtor ? 'Realtor' : (isTenant ? 'Tenant' : 'Buyer');
 
+  // Gate — confirm caller actually wants to ask about a specific property
+  const gather = twiml.gather({
+    input: 'speech dtmf', numDigits: 1, timeout: 8, speechTimeout: 'auto',
+    language: VOICE[lang].language,
+    hints: lang === 'es'
+      ? 'si, no, otro, uno, dos, 1, 2'
+      : 'yes, no, other, one, two, 1, 2',
+    action: `${process.env.BASE_URL}/property-gate?lang=${lang}&type=${callerType}&callSid=${callSid}`,
+    method: 'POST',
+  });
+
+  if (lang === 'es') {
+    gather.say(VOICE.es,
+      'Esta llamando sobre una propiedad especifica? Diga si u oprima 1. ' +
+      'Para algo distinto, oprima 2 o diga otra cosa.'
+    );
+  } else {
+    gather.say(VOICE.en,
+      'Are you calling about a specific property? Say yes or press 1. ' +
+      'For something else, press 2 or say something else.'
+    );
+  }
+
+  twiml.redirect(`${process.env.BASE_URL}/voicemail?lang=${lang}&reason=no_input&type=${callerType}&callSid=${callSid}`);
+  res.type('text/xml').send(twiml.toString());
+});
+
+// STEP 3b — PROPERTY GATE → ask for address OR go straight to voicemail
+app.post('/property-gate', (req, res) => {
+  const speech     = (req.body.SpeechResult || '').toLowerCase().trim();
+  const digits     = (req.body.Digits || '').trim();
+  const lang       = req.query.lang || 'en';
+  const callerType = req.query.type || 'Buyer';
+  const callSid    = req.query.callSid || req.body.CallSid;
+  const twiml      = new VoiceResponse();
+
+  const isSomethingElse = digits === '2' ||
+    /no|otro|otra|something else|other|else|2/.test(speech);
+
+  if (isSomethingElse) {
+    say(twiml, lang, lang === 'es'
+      ? 'Por favor deje su mensaje despues del tono y le contactaremos a la brevedad.'
+      : 'Please leave your message after the tone and we will get back to you shortly.'
+    );
+    twiml.record({
+      maxLength: 120, transcribe: true,
+      transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=&lang=${lang}&attention=true`,
+      action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
+    });
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // Default / yes → proceed to ask for the address
   const gather = twiml.gather({
     input: 'speech', timeout: 8, speechTimeout: 'auto',
     language: VOICE[lang].language,
