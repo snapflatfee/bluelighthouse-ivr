@@ -203,25 +203,19 @@ function isWithinBusinessHours() {
 app.post('/inbound', (req, res) => {
   const twiml = new VoiceResponse();
 
-  // After-hours check — bypass entire IVR and go straight to bilingual voicemail
+  // After-hours: ask for language first, then play voicemail prompt in chosen language only
   if (!isWithinBusinessHours()) {
-    say(twiml, 'en',
-      'Thank you for calling Jorge Zea, Real Estate Broker. ' +
-      'Unfortunately you reached us outside of our working schedule, ' +
-      'which is from 7 AM to 9 PM every day. Please leave us a message ' +
-      'with the property address you are calling about after the tone.'
-    );
-    say(twiml, 'es',
-      'Gracias por llamar a Jorge Zea, Real Estate Broker. ' +
-      'Desafortunadamente estamos fuera de nuestro horario de atencion ' +
-      'de 7 AM a 9 PM todos los dias. Por favor deje un mensaje con la ' +
-      'direccion de la propiedad despues del tono.'
-    );
-    twiml.record({
-      maxLength: 120, transcribe: true,
-      transcribeCallback: `${process.env.BASE_URL}/afterhours-transcribed`,
-      action: `${process.env.BASE_URL}/voicemail-done?lang=en`, method: 'POST',
+    const gather = twiml.gather({
+      input: 'speech dtmf', numDigits: 1, timeout: 6, speechTimeout: 'auto',
+      language: 'en-US',
+      hints: 'English, Spanish, espanol, one, two, uno, dos, 1, 2',
+      action: `${process.env.BASE_URL}/afterhours-lang`, method: 'POST',
     });
+    // Brief bilingual notice + language selection — caller hears both ONCE, then only their language
+    gather.say(VOICE.en, 'Thank you for calling Jorge Zea, Real Estate Broker. For English press 1.');
+    gather.say(VOICE.es, 'Gracias por llamar a Jorge Zea, Real Estate Broker. Para espanol oprima 2.');
+    // Default if no input — English
+    twiml.redirect(`${process.env.BASE_URL}/afterhours-lang`);
     return res.type('text/xml').send(twiml.toString());
   }
 
@@ -250,6 +244,28 @@ app.post('/inbound', (req, res) => {
   );
 
   twiml.redirect(`${process.env.BASE_URL}/select-language`);
+  res.type('text/xml').send(twiml.toString());
+});
+
+// AFTER-HOURS LANGUAGE HANDLER — plays single-language voicemail prompt
+app.post('/afterhours-lang', (req, res) => {
+  const speech = (req.body.SpeechResult || '').toLowerCase().trim();
+  const digits = (req.body.Digits || '').trim();
+  const lang   = (digits === '2' || /espa|spanish|dos|2/.test(speech)) ? 'es' : 'en';
+  const twiml  = new VoiceResponse();
+
+  say(twiml, lang, lang === 'es'
+    ? 'Desafortunadamente estamos fuera de nuestro horario de atencion de 7 AM a 9 PM todos los dias. ' +
+      'Por favor deje un mensaje con la direccion de la propiedad despues del tono y le contactaremos a la brevedad.'
+    : 'Unfortunately you reached us outside of our working schedule, which is from 7 AM to 9 PM every day. ' +
+      'Please leave a message with the property address you are calling about after the tone and we will get back to you shortly.'
+  );
+
+  twiml.record({
+    maxLength: 120, transcribe: true,
+    transcribeCallback: `${process.env.BASE_URL}/afterhours-transcribed?lang=${lang}`,
+    action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
+  });
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -357,8 +373,11 @@ app.post('/lookup-property', async (req, res) => {
   const callerNumber  = req.body.From || '';
   const twiml         = new VoiceResponse();
 
-  // If caller pressed 2 / said "something else" at address prompt → attention voicemail
-  const isSomethingElse = digits === '2' || /something else|other|otro|otra|no|2/.test(speech) && speech.length < 30;
+  // Only treat as "something else" if caller explicitly pressed 2 or said clear opt-out words
+  // Removed "no" from regex — too many street names contain "no" as a substring
+  const isSomethingElse = digits === '2' ||
+    /\b(something else|other|otro|otra)\b/i.test(speech);
+
   if (isSomethingElse) {
     say(twiml, lang, lang === 'es'
       ? 'Por favor deje un mensaje detallado despues del tono y le contactaremos prontamente.'
@@ -372,9 +391,25 @@ app.post('/lookup-property', async (req, res) => {
     return res.type('text/xml').send(twiml.toString());
   }
 
+  // If nothing was said (speech recognition timed out), go to voicemail gracefully
+  if (!spokenAddress.trim()) {
+    say(twiml, lang, lang === 'es'
+      ? 'No recibimos la direccion. Por favor deje su mensaje despues del tono.'
+      : 'We didn\'t catch the address. Please leave your message after the tone.'
+    );
+    twiml.record({
+      maxLength: 120, transcribe: true,
+      transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=&lang=${lang}&attention=true`,
+      action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
+    });
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  // ── AIRTABLE LOOKUP ────────────────────────────────────────────────────────
+  let logId = '';
+
   try {
-    // Search ALL listings regardless of status so we can distinguish
-    // "no such property" from "property exists but is no longer available"
+    // Search ALL listings to distinguish "no such property" from "no longer available"
     const records = await base('ALL LISTINGS').select({
       fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email','BAC Offered','Commission NOTES','Type','List Price','Notes','prop_id','Status'],
     }).all();
@@ -387,33 +422,40 @@ app.post('/lookup-property', async (req, res) => {
       name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
       bac: r.get('BAC Offered') || '', commNotes: r.get('Commission NOTES') || '',
       type: r.get('Type') || '', price: r.get('List Price') || '', notes: r.get('Notes') || '',
-      status: r.get('Status') || '',
+      status: (r.get('Status') || ''),
     }));
 
     const fuse    = new Fuse(listings, { keys: ['address','fullAddress','city'], threshold: 0.45, includeScore: true });
-    const results = fuse.search(spokenAddress);
+    const results = fuse.search(spokenAddress.trim());
     const match   = results.length > 0 ? results[0].item : null;
 
-    const logFields = {
-      Name: `Call ${new Date().toISOString()}`, Call_ID: callSid,
-      Call_Date: new Date().toISOString(), Caller_Number: callerNumber,
-      Caller_Type: callerType, Language: lang === 'es' ? 'Spanish' : 'English',
-      Property_Address: spokenAddress.trim(),
-      // Caller consented by staying on the line past the FL two-party notice
-      Notes: 'Caller consented to recording by continuing on the line (FL two-party notice played at greeting).',
-    };
-
-    if (match) {
-      logFields.Real_Address  = match.fullAddress;
-      logFields.Prop_ID       = match.prop_id;
-      logFields.BAC_Disclosed = callerType === 'Realtor' ? match.bac : '';
-      logFields.Listing_Link  = [{ id: match.id }];
-    } else {
-      logFields.Call_Disposition = 'No Match Found';
+    // ── CREATE CALL LOG RECORD — isolated so a log failure never kills the call flow ──
+    try {
+      const logFields = {
+        Name:             `Call ${new Date().toISOString()}`,
+        Call_ID:          callSid,
+        Call_Date:        new Date().toISOString(),
+        Caller_Number:    callerNumber,
+        Caller_Type:      callerType,
+        Language:         lang === 'es' ? 'Spanish' : 'English',
+        Property_Address: spokenAddress.trim(),
+        Notes:            'Caller consented to recording by continuing on the line (FL two-party notice played at greeting).',
+      };
+      if (match) {
+        logFields.Real_Address  = match.fullAddress;
+        logFields.Prop_ID       = match.prop_id;
+        logFields.BAC_Disclosed = callerType === 'Realtor' ? match.bac : '';
+        logFields.Listing_Link  = [{ id: match.id }];
+      } else {
+        logFields.Call_Disposition = 'No Match Found';
+      }
+      const logRecord = await base('CALL LOG').create(logFields);
+      logId = logRecord.id;
+    } catch (logErr) {
+      // Log creation failed — log to console but DO NOT let it block the call
+      console.error('CALL LOG create error (non-fatal):', logErr.message || logErr);
     }
-
-    const logRecord = await base('CALL LOG').create(logFields);
-    const logId     = logRecord.id;
+    // ─────────────────────────────────────────────────────────────────────────
 
     if (!match) {
       say(twiml, lang, lang === 'es'
@@ -424,10 +466,9 @@ app.post('/lookup-property', async (req, res) => {
     }
 
     // Status filter — only Active or Pending listings proceed to full flow
-    const statusOk = /^active$|^pending$/i.test((match.status || '').trim());
+    const statusOk = /^active$|^pending$/i.test((match.status || '').toString().trim());
     if (!statusOk) {
-      await base('CALL LOG').update(logId, { Call_Disposition: 'No Match Found', Notes: `Property found but Status = "${match.status}" (not Active/Pending)` }).catch(console.error);
-
+      if (logId) await base('CALL LOG').update(logId, { Call_Disposition: 'No Match Found', Notes: `Property found but Status = "${match.status}" (not Active/Pending)` }).catch(console.error);
       say(twiml, lang, lang === 'es'
         ? 'Desafortunadamente esta propiedad ya no se encuentra disponible. Si desea dejar un mensaje, por favor hagalo despues del tono.'
         : 'Unfortunately this property is no longer available. If you want, you may leave a message after the tone.'
@@ -446,7 +487,7 @@ app.post('/lookup-property', async (req, res) => {
       return buyerTenantFlow(res, twiml, { match, lang, callerNumber, callerType, callSid, logId });
     }
   } catch (err) {
-    console.error('Lookup error:', err);
+    console.error('Lookup error (Airtable or Fuse):', err.message || err);
     say(twiml, lang, lang === 'es' ? 'Tenemos un problema tecnico. Por favor deje un mensaje.' : 'We\'re experiencing a technical issue. Please leave a message.');
     twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=error&lang=${lang}&callSid=${callSid}`);
     res.type('text/xml').send(twiml.toString());
