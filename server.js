@@ -22,6 +22,33 @@ app.get('/dashboard', (req, res) => {
   res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
+// ─── AIRTABLE CONNECTIVITY TEST ─────────────────────────────────────────────
+// Visit in browser: https://elegant-forgiveness-production-bd35.up.railway.app/test-airtable
+app.get('/test-airtable', async (req, res) => {
+  const result = {
+    AIRTABLE_API_KEY: process.env.AIRTABLE_API_KEY ? `set (${process.env.AIRTABLE_API_KEY.slice(0,12)}...)` : 'MISSING',
+    AIRTABLE_BASE_ID: process.env.AIRTABLE_BASE_ID || 'MISSING',
+    BASE_URL:         process.env.BASE_URL         || 'MISSING',
+  };
+  try {
+    const recs = await base('ALL LISTINGS').select({ maxRecords: 2, fields: ['prop_id','Status'] }).firstPage();
+    result.all_listings_ok = true;
+    result.sample = recs.map(r => ({ id: r.id, prop_id: r.get('prop_id'), status: r.get('Status') }));
+  } catch (err) {
+    result.all_listings_ok = false;
+    result.all_listings_error = err.message;
+    result.status_code = err.statusCode;
+  }
+  try {
+    const recs2 = await base('CALL LOG').select({ maxRecords: 1, fields: ['Name'] }).firstPage();
+    result.call_log_ok = true;
+  } catch (err) {
+    result.call_log_ok = false;
+    result.call_log_error = err.message;
+  }
+  res.json(result);
+});
+
 // ─── INBOUND SMS — replies from callers/sellers ──────────────────────────────
 app.post('/sms-inbound', async (req, res) => {
   const from = req.body.From || '';
@@ -487,7 +514,8 @@ app.post('/lookup-property', async (req, res) => {
       return buyerTenantFlow(res, twiml, { match, lang, callerNumber, callerType, callSid, logId });
     }
   } catch (err) {
-    console.error('Lookup error (Airtable or Fuse):', err.message || err);
+    console.error('Lookup error — message:', err.message, '| statusCode:', err.statusCode, '| error:', JSON.stringify(err.error || ''));
+    console.error('Env at error time — API_KEY set:', !!process.env.AIRTABLE_API_KEY, '| BASE_ID:', process.env.AIRTABLE_BASE_ID);
     say(twiml, lang, lang === 'es' ? 'Tenemos un problema tecnico. Por favor deje un mensaje.' : 'We\'re experiencing a technical issue. Please leave a message.');
     twiml.redirect(`${process.env.BASE_URL}/voicemail?reason=error&lang=${lang}&callSid=${callSid}`);
     res.type('text/xml').send(twiml.toString());
