@@ -176,10 +176,30 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 const base          = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);
 const claude        = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const mailer = nodemailer.createTransport({
-  service: 'gmail',
-  auth: { user: process.env.EMAIL_FROM, pass: process.env.EMAIL_APP_PASSWORD },
-});
+// ─── Email via Resend (Railway blocks SMTP port 587 — use HTTP API instead) ──
+// Sign up free at resend.com, get API key, add RESEND_API_KEY to Railway env vars
+// Sends FROM noreply@snapflatfee.com, replies go to snapflatfee@gmail.com
+async function sendEmail({ to, subject, html }) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: 'SnapFlatFee IVR <noreply@snapflatfee.com>',
+      reply_to: ['snapflatfee@gmail.com'],
+      to: Array.isArray(to) ? to : [to],
+      subject,
+      html,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Resend error ${res.status}: ${err}`);
+  }
+  return res.json();
+}
 
 const VOICE = {
   en: { voice: process.env.VOICE_EN || 'Google.en-US-Chirp3-HD-Aoede',  language: 'en-US' },
@@ -209,12 +229,34 @@ async function postCallSends(logId) {
     const callerNumber       = logRecord.get('Caller_Number') || '';
     const callerType         = logRecord.get('Caller_Type')   || 'Buyer';
     const lang               = logRecord.get('Language') === 'Spanish' ? 'es' : 'en';
-    const listingLinks       = logRecord.get('Listing_Link')  || [];
-    if (!listingLinks.length) return;
+    // Try Listing_Link first — Airtable sometimes silently drops linked record
+    // writes on create, so fall back to Prop_ID search if link is empty
+    let listing = null;
+    const listingLinks = logRecord.get('Listing_Link') || [];
+    if (listingLinks.length) {
+      listing = await base('ALL LISTINGS').find(listingLinks[0]).catch(() => null);
+    }
+    if (!listing) {
+      const propId = (logRecord.get('Prop_ID') || '').toString().trim();
+      if (!propId) {
+        console.log(`postCallSends: no Listing_Link or Prop_ID on logId ${logId} — nothing to send`);
+        return;
+      }
+      const recs = await base('ALL LISTINGS').select({
+        filterByFormula: `{prop_id}="${propId}"`,
+        maxRecords: 1,
+        fields: ['Address','Street Address','City','Phone','Email','Name','SMS_Recording_Consent'],
+      }).firstPage();
+      if (!recs.length) {
+        console.log(`postCallSends: no listing found for prop_id ${propId}`);
+        return;
+      }
+      listing = recs[0];
+      console.log(`postCallSends: Listing_Link was empty — used Prop_ID fallback (${propId})`);
+    }
 
-    const listing     = await base('ALL LISTINGS').find(listingLinks[0]);
-    const address     = listing.get('Address') || listing.get('Street Address') || '';
-    const city        = listing.get('City') || '';
+    const address = listing.get('Address') || listing.get('Street Address') || '';
+    const city    = listing.get('City') || '';
 
     // SMS to caller (only if they opted in during call)
     if (callerSMSRequested && callerNumber) {
@@ -500,17 +542,10 @@ app.post('/lookup-property', async (req, res) => {
     return res.type('text/xml').send(twiml.toString());
   }
 
-  // No address spoken
+  // No address spoken — route through /voicemail so CALL LOG is always created
+  // This also handles Spanish callers whose en-US STT returns empty
   if (!spokenAddress.trim()) {
-    say(twiml, lang, lang === 'es'
-      ? 'No recibimos la direccion. Por favor deje su mensaje despues del tono.'
-      : 'We didn\'t catch the address. Please leave your message after the tone.'
-    );
-    twiml.record({
-      maxLength: 120, transcribe: true,
-      transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=&lang=${lang}&attention=true`,
-      action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
-    });
+    twiml.redirect(`${process.env.BASE_URL}/voicemail?lang=${lang}&reason=no_address&type=${callerType}&callSid=${callSid}&attention=true`);
     return res.type('text/xml').send(twiml.toString());
   }
 
@@ -550,7 +585,7 @@ app.post('/lookup-property', async (req, res) => {
         logFields.Real_Address  = match.fullAddress;
         logFields.Prop_ID       = match.prop_id;
         logFields.BAC_Disclosed = callerType === 'Realtor' ? match.bac : '';
-        logFields.Listing_Link  = [{ id: match.id }];
+        logFields.Listing_Link  = [match.id];  // Airtable JS client expects string IDs, not objects
       } else {
         logFields.Call_Disposition = 'No Match Found';
       }
@@ -1015,10 +1050,16 @@ app.post('/voicemail', async (req, res) => {
   const context = matchAddress
     ? (lang === 'es' ? ` Sobre: ${matchAddress}.` : ` Regarding: ${matchAddress}.`) : '';
 
-  say(twiml, lang, lang === 'es'
-    ? `Por favor deje su mensaje con su nombre y numero de telefono despues del tono.${context} Le contactaremos a la brevedad.`
-    : `Please leave your message with your name and callback number after the tone.${context} We'll get back to you shortly.`
-  );
+  // Slightly different prompt when address wasn't captured
+  const noAddressPrompt = reason === 'no_address';
+  const promptEN = noAddressPrompt
+    ? `We weren't able to capture the property address. Please leave your name, callback number and the full property address after the tone and we will get back to you shortly.`
+    : `Please leave your message with your name and callback number after the tone.${context} We'll get back to you shortly.`;
+  const promptES = noAddressPrompt
+    ? `No pudimos capturar la direccion de la propiedad. Por favor deje su nombre, numero de telefono y la direccion completa despues del tono y le contactaremos a la brevedad.`
+    : `Por favor deje su mensaje con su nombre y numero de telefono despues del tono.${context} Le contactaremos a la brevedad.`;
+
+  say(twiml, lang, lang === 'es' ? promptES : promptEN);
   twiml.record({
     maxLength: 120, transcribe: true,
     transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=${attention}&branch=${req.query.branch || ''}`,
@@ -1063,21 +1104,21 @@ app.post('/voicemail-transcribed', async (req, res) => {
 
   if (isCommission) {
     // Commission branch → snapflatfee2 ONLY — do not email seller
-    await mailer.sendMail({
+    await sendEmail({
       from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
       subject: '⚠️ IVR Commission Branch Voicemail — Review Required',
       html: html('Commission Branch Voicemail', `<p><b>Call SID:</b> ${callSid}</p><p><b>Language:</b> ${lang === 'es' ? 'Spanish' : 'English'}</p>`),
     }).catch(console.error);
   } else if (sellerEmail) {
     // FCHB: direct to seller
-    await mailer.sendMail({
+    await sendEmail({
       from: process.env.EMAIL_FROM, to: sellerEmail,
       subject: 'Voicemail received for your listing',
       html: html('Voicemail — Blue Lighthouse Realty', `<p><b>Call SID:</b> ${callSid}</p>`),
     }).catch(console.error);
   } else {
     // Normal flow
-    await mailer.sendMail({
+    await sendEmail({
       from: process.env.EMAIL_FROM,
       to: isAttention ? 'snapflatfee2@gmail.com' : process.env.EMAIL_TO,
       subject: isAttention ? 'IVR — Voicemail needs attention' : `📞 New Voicemail — ${ts}`,
@@ -1117,11 +1158,11 @@ app.post('/afterhours-transcribed', async (req, res) => {
       Caller_Type: 'Unknown', Property_Address: transcript, Transcript: transcript,
       Voicemail_URL: recordingUrl, Call_Disposition: match ? 'Voicemail Left' : 'No Match Found',
       Real_Address: match ? match.fullAddress : '',
-      Listing_Link: match ? [{ id: match.id }] : undefined,
+      Listing_Link: match ? [match.id] : undefined,
     }).catch(e => console.error('After-hours log error:', e));
 
     if (match && match.email) {
-      await mailer.sendMail({
+      await sendEmail({
         from: process.env.EMAIL_FROM, to: match.email,
         subject: `After-hours lead call — ${match.fullAddress}`,
         html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
@@ -1136,7 +1177,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
         </div>`,
       }).catch(console.error);
     } else {
-      await mailer.sendMail({
+      await sendEmail({
         from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
         subject: 'IVR — After-hours call (no match)',
         html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
@@ -1149,7 +1190,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
     }
   } catch (err) {
     console.error('After-hours processing error:', err);
-    await mailer.sendMail({
+    await sendEmail({
       from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
       subject: 'IVR — After-hours call (error)',
       html: `<p>Error processing. Caller: ${callerNumber}. <a href="${recordingUrl}">Listen</a>. Transcript: ${transcript}</p>`,
@@ -1231,9 +1272,9 @@ async function notifySeller({ record, callerNumber, callerType, address, city })
   const callerLabelSMS = callerType === 'Realtor' ? 'Realtor' : 'Direct Buyer';
 
   if (sellerEmail) {
-    await mailer.sendMail({
+    await sendEmail({
       from: process.env.EMAIL_FROM, to: sellerEmail,
-      subject: `Lead call received — ${address}, ${city}`,
+      subject: `SnapFlatFee Lead Call Received. ${address}, ${city}`,
       html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
         <h2 style="color:#003087;">Call Notification — Blue Lighthouse Realty</h2>
         <p>Dear ${sellerName},</p>
