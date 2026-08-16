@@ -1267,7 +1267,7 @@ async function notifySeller({ record, callerNumber, callerType, address, city })
   const sellerEmail    = record.get('Email');
   const sellerPhone    = record.get('Phone');
   const sellerName     = record.get('Name') || 'Seller';
-  const airtableConsent = (record.get('SMS_Recording_Consent') || '').toString().toUpperCase() === 'YES';
+  const airtableConsent = (record.get('SMS_Recording_Consent') || '').toString().trim() === 'Yes I Agree';
   const callerLabel    = callerType === 'Realtor' ? 'a Realtor' : 'a Direct Buyer';
   const callerLabelSMS = callerType === 'Realtor' ? 'Realtor' : 'Direct Buyer';
 
