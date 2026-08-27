@@ -723,31 +723,41 @@ app.post('/realtor-question', async (req, res) => {
       'You will need to be compensated by your buyer as per your buyer-broker agreement. ' +
       'However, after showing the property, when preparing an offer, this can always be negotiated, ' +
       'and the seller might help your buyer pay your compensation depending on all terms of the offer and the net proceeds to the seller. ' +
-      'Press 1 or say showing to schedule a showing, or leave a message after the tone.';
+      'Press 1 or say showing to schedule a showing. Press 2 or say message to leave a message for the broker.';
 
     const scriptES =
       'No hay una oferta anticipada de compensacion para esta propiedad. ' +
       'Usted debera ser compensado por su comprador segun su acuerdo de representacion. ' +
       'Sin embargo, al presentar una oferta, esto siempre puede negociarse, ' +
       'y el vendedor podria ayudar a su comprador a pagar su compensacion segun los terminos y las ganancias netas del vendedor. ' +
-      'Oprima 1 o diga visita para programar una visita, o deje un mensaje despues del tono.';
+      'Oprima 1 o diga visita para programar una visita. Oprima 2 o diga mensaje para dejar un mensaje para el corredor.';
+
+    // Played when the realtor leaves a message instead of scheduling a showing —
+    // invites open feedback on the commission policy specifically, since that's
+    // the context (Sherman Act evidence layer, see README). Recorded + routed to
+    // snapflatfee2 ONLY, never the seller (see branch=commission below).
+    const messagePromptEN =
+      'Please leave a detailed message after the tone. We value feedback from all our cooperating agents, ' +
+      'including any comments about our commission policy, and will make sure it reaches the broker directly.';
+    const messagePromptES =
+      'Por favor deje un mensaje detallado despues del tono. Valoramos los comentarios de todos nuestros agentes cooperantes, ' +
+      'incluyendo cualquier comentario sobre nuestra politica de comisiones, y nos aseguraremos de que llegue directamente al corredor.';
 
     await base('CALL LOG').update(logId, { Transcript: `Realtor asked about commission. Response played.` }).catch(console.error);
 
     const gather = twiml.gather({
-      input: 'speech dtmf', numDigits: 1, timeout: 4, speechTimeout: 'auto',
+      input: 'speech dtmf', numDigits: 1, timeout: 6, speechTimeout: 'auto',
       language: VOICE[lang].language,
-      hints: lang === 'es' ? 'visita, uno, 1, mostrar, si' : 'showing, show, one, 1, schedule, yes',
+      hints: lang === 'es'
+        ? 'visita, uno, 1, mostrar, si, mensaje, dos, 2'
+        : 'showing, show, one, 1, schedule, yes, message, two, 2',
       action: `${process.env.BASE_URL}/realtor-commission-choice?lang=${lang}&logId=${logId}&matchId=${encodeURIComponent(matchId)}&callerNumber=${encodeURIComponent(callerNumber)}&isRental=${isRental}`,
       method: 'POST',
     });
     gather.say(VOICE[lang], lang === 'es' ? scriptES : scriptEN);
 
-    // 4 sec timeout → voicemail → snapflatfee2 ONLY (not seller — may contain complaints)
-    say(twiml, lang, lang === 'es'
-      ? 'Por favor deje un mensaje detallado despues del tono y alguien le contactara prontamente.'
-      : 'Please leave a detailed message after the tone and someone will contact you promptly.'
-    );
+    // 6 sec timeout with no input → voicemail → snapflatfee2 ONLY (not seller — may contain complaints)
+    say(twiml, lang, lang === 'es' ? messagePromptES : messagePromptEN);
     twiml.record({
       maxLength: 120, transcribe: true,
       transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=true&branch=commission`,
@@ -766,7 +776,7 @@ app.post('/realtor-question', async (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// ─── REALTOR COMMISSION CHOICE (after commission script, 4s timeout) ──────────
+// ─── REALTOR COMMISSION CHOICE (after commission script, 6s timeout) ──────────
 app.post('/realtor-commission-choice', (req, res) => {
   const speech       = (req.body.SpeechResult || '').toLowerCase().trim();
   const digits       = (req.body.Digits || '').trim();
@@ -782,10 +792,11 @@ app.post('/realtor-commission-choice', (req, res) => {
   if (wantsShow) {
     playTransferPrompt(twiml, lang, isRental, logId, matchId, callerNumber);
   } else {
-    // No choice → voicemail → snapflatfee2 ONLY
+    // Explicit "message" choice, or anything else recognized as speech/digits that
+    // wasn't "showing" → voicemail → snapflatfee2 ONLY (not seller — may contain complaints)
     say(twiml, lang, lang === 'es'
-      ? 'Por favor deje un mensaje despues del tono y alguien le contactara prontamente.'
-      : 'Please leave a message after the tone and someone will contact you promptly.'
+      ? 'Por favor deje un mensaje detallado despues del tono. Valoramos los comentarios de todos nuestros agentes cooperantes, incluyendo cualquier comentario sobre nuestra politica de comisiones, y nos aseguraremos de que llegue directamente al corredor.'
+      : 'Please leave a detailed message after the tone. We value feedback from all our cooperating agents, including any comments about our commission policy, and will make sure it reaches the broker directly.'
     );
     twiml.record({
       maxLength: 120, transcribe: true,
