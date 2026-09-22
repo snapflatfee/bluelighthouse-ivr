@@ -61,6 +61,7 @@ bluelighthouse-ivr/
 | `BASE_URL` | `https://elegant-forgiveness-production-bd35.up.railway.app` |
 | `VOICE_EN` *(optional)* | Overrides the default English Twilio voice (`Google.en-US-Chirp3-HD-Aoede`) |
 | `VOICE_ES` *(optional)* | Overrides the default Spanish Twilio voice (`Google.es-US-Chirp3-HD-Zephyr`) |
+| `HOLD_MUSIC_URL` *(optional)* | Public URL of a short (~3–5s) MP3 played after "One moment while I look that up" while the Airtable lookup runs. Unset = spoken line only |
 | `PORT` | Set automatically by Railway |
 
 **`EMAIL_TO` is load-bearing, not optional.** It's the fallback recipient in `/voicemail-transcribed` when a call has no property match. If it's unset in Railway, those voicemail notifications fail silently.
@@ -209,6 +210,22 @@ This means SMS history the dashboard shows is not stored in Airtable — it's re
 
 ### FCHB (Florida Cash Home Buyers)
 Emails `kevin@floridacashhomebuyers.com` or `alejandro@floridacashhomebuyers.com` → skip all transfer logic, go straight to voicemail, email transcript directly to that seller. Checked AFTER address match and AFTER Realtor/Buyer branch decision, inside `realtorFlow` and `buyerTenantFlow`.
+
+### Lookup flow (hold + "Great, I found…")
+`/lookup-property` is now a front door: it starts the Airtable listings fetch in the background (`fetchListings()`, cached per CallSid), says "One moment while I look that up" (+ `HOLD_MUSIC_URL` if set), then redirects to `/lookup-property-run`, which does the Fuse match (`handleLookup()`). "Something else"/no-address input skips the hold. After a match, Realtor and Buyer flows open with "Great, I found {address}" (`speakableAddress()` expands SW/Ave etc. for TTS). If the search outlasts the first hold, `/lookup-property-run` holds again (up to 2 extra rounds via `attempt=`), and the wait is capped at 8s → `/universal-fallback`. Ringing while connecting to the seller can't be replaced with music without moving to `<Conference>`.
+
+### Post-call sends are de-duplicated
+`postCallSends(logId)` is triggered by both `/seller-unavailable` and `/call-status`. An in-memory `postCallSentLogIds` set makes it fire once per call (cleared after 2h, or on error so the backup can retry). Lost on restart — acceptable for this volume.
+
+### Seller whisper and "take a message"
+The seller hears: "Hi, this is SnapFlatFee calling. We have {a Realtor | a potential buyer | a potential tenant} on the line inquiring about your property. Press 1 or say yes to connect. Or press 2 or say no, and we'll take a message and send it to you by email." Caller type is passed `flag-sms`/flows → `/transfer-seller?type=` → `/seller-whisper?callerType=`. Press 2 / no / no answer → caller hears the "seller not available" menu → voicemail with `branch=seller&sellerEmail=…` → `/voicemail-transcribed` emails the seller and sends a copy to `EMAIL_TO`.
+
+### SMS wording
+Caller SMS: "Hi. The info you requested for Property: {address, city state zip}. Contact Seller|Landlord for showings and questions at Phone… Email… Attn: Jorge Zea - Broker - Realtor." then a blank line and the opt-out. (Buyers also get the sell-with-SnapFlatFee line.) Seller SMS: "Lead alert from SnapFlatFee.com. Call received inquiring about your property…", blank line before "Attn:". **No ® anywhere in SMS** (it forces Unicode encoding); emails still carry it.
+
+Seller "Lead Call Received" email + SMS intentionally fire for every matched call that ends (including commission voicemails, inactive listings, hang-ups) — decided to keep.
+
+Hold music: files in `audio/` are served at `BASE_URL/audio/<file>`; set `HOLD_MUSIC_URL` to that URL (currently `audio/hold.wav`, a 4s clip with 1s fade-out; the original 112s hold.mp3 is not for the repo).
 
 ### Commission branch voicemail
 After the commission-disclosure script, the realtor gets an explicit two-option menu (6s window): "Press 1 / say showing" → transfers to the seller via `playTransferPrompt`; "press 2 / say message" (or silence/timeout, or anything else recognized) → voicemail. The message-leaving prompt (in both `/realtor-question`'s timeout fallback and `/realtor-commission-choice`'s else branch) explicitly invites feedback on the commission policy — this is the Sherman Act evidence layer (see README) doing its job: any pushback on the no-BAC-offered policy gets recorded on tape.
