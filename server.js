@@ -254,10 +254,10 @@ async function fetchRecordingAttachment(recordingUrl, filename = 'voicemail.mp3'
 // Twilio URL is auth-gated — unlike a normal {url}-style attachment, Airtable
 // never has to fetch anything itself. Field is matched by NAME ("Voicemail
 // File"); if that field is ever renamed in Airtable, update this to match.
-async function uploadRecordingToAirtable(recordId, base64, filename = 'voicemail.mp3') {
+async function uploadRecordingToAirtable(recordId, base64, filename = 'voicemail.mp3', fieldName = 'Voicemail File') {
   if (!recordId || !base64) return false;
   try {
-    const url = `https://content.airtable.com/v0/${process.env.AIRTABLE_BASE_ID}/${recordId}/${encodeURIComponent('Voicemail File')}/uploadAttachment`;
+    const url = `https://content.airtable.com/v0/${process.env.AIRTABLE_BASE_ID}/${recordId}/${encodeURIComponent(fieldName)}/uploadAttachment`;
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -1107,10 +1107,16 @@ app.post('/seller-consent', (req, res) => {
 app.post('/second-leg-recording', async (req, res) => {
   const recordingUrl = req.body.RecordingUrl || '';
   const logId        = req.query.logId || '';
+  res.sendStatus(200); // ack Twilio immediately; the fetch+upload below can take a moment
   if (logId && recordingUrl) {
     await base('CALL LOG').update(logId, { Second_Leg_Recording_URL: recordingUrl }).catch(console.error);
+    // Full call recording, not a 120s-capped voicemail — can be much larger,
+    // so it's pushed straight to Airtable's "Call Recording File" field, not emailed.
+    const attachment = await fetchRecordingAttachment(recordingUrl, 'call-recording.mp3');
+    if (attachment) {
+      await uploadRecordingToAirtable(logId, attachment[0].content, 'call-recording.mp3', 'Call Recording File');
+    }
   }
-  res.sendStatus(200);
 });
 
 // ─── SELLER STATUS ────────────────────────────────────────────────────────────
