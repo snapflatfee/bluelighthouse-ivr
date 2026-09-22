@@ -17,6 +17,9 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 const path = require('path');
 
+// Static audio (e.g. hold music). Put files in ./audio, reference as BASE_URL/audio/<file>
+app.use('/audio', express.static(path.join(__dirname, 'audio')));
+
 // ─── Dashboard UI ────────────────────────────────────────────────────────────
 app.get('/dashboard', (req, res) => {
   res.sendFile(path.join(__dirname, 'dashboard.html'));
@@ -221,8 +224,13 @@ function isWithinBusinessHours() {
 // ─── POST-CALL SENDS ─────────────────────────────────────────────────────────
 // Reads CALL LOG record and fires pending SMS/email AFTER the call ends.
 // Called from seller-unavailable (completed) and via /call-status callback.
+const postCallSentLogIds = new Set();
 async function postCallSends(logId) {
   if (!logId) return;
+  // /seller-unavailable AND /call-status both trigger this — send once per call
+  if (postCallSentLogIds.has(logId)) return;
+  postCallSentLogIds.add(logId);
+  setTimeout(() => postCallSentLogIds.delete(logId), 2 * 60 * 60 * 1000).unref();
   try {
     const logRecord          = await base('CALL LOG').find(logId);
     const callerSMSRequested = logRecord.get('Caller_SMS_Requested') || false;
@@ -245,7 +253,7 @@ async function postCallSends(logId) {
       const recs = await base('ALL LISTINGS').select({
         filterByFormula: `{prop_id}="${propId}"`,
         maxRecords: 1,
-        fields: ['Address','Street Address','City','Phone','Email','Name','SMS_Recording_Consent'],
+        fields: ['Address','Street Address','City','State','Zip code','Type','Phone','Email','Name','SMS_Recording_Consent'],
       }).firstPage();
       if (!recs.length) {
         console.log(`postCallSends: no listing found for prop_id ${propId}`);
@@ -257,15 +265,21 @@ async function postCallSends(logId) {
 
     const address = listing.get('Address') || listing.get('Street Address') || '';
     const city    = listing.get('City') || '';
+    const state   = listing.get('State') || '';
+    const zip     = listing.get('Zip code') || '';
+    const fullAddr = [address, [city, state, zip].filter(Boolean).join(' ')].filter(Boolean).join(', ');
 
     // SMS to caller (only if they opted in during call)
     if (callerSMSRequested && callerNumber) {
       const isBuyer   = callerType !== 'Realtor';
-      const buyerAdEN = isBuyer ? ' If you ever need to sell your property and save the entire commission, visit www.SnapFlatFee.com®' : '';
-      const buyerAdES = isBuyer ? ' Para vender su propiedad y ahorrar la comision visitenos en www.SnapFlatFee.com®' : '';
+      const isRental  = /rent|lease/i.test((listing.get('Type') || '').toString());
+      const partyEN   = isRental ? 'Landlord' : 'Seller';
+      const partyES   = isRental ? 'el propietario' : 'el vendedor';
+      const buyerAdEN = isBuyer ? ' If you ever need to sell your property and save the entire commission, visit www.SnapFlatFee.com' : '';
+      const buyerAdES = isBuyer ? ' Para vender su propiedad y ahorrar la comision visitenos en www.SnapFlatFee.com' : '';
       const msgBody   = lang === 'es'
-        ? `La informacion solicitada: Propiedad: ${address}, ${city}. Telefono: ${listing.get('Phone') || ''}. Email: ${listing.get('Email') || ''}. Attn: Jorge Zea - Broker - Realtor®.${buyerAdES} Tarifas pueden aplicar. Responda STOP para cancelar.`
-        : `The info you requested: Property: ${address}, ${city}. Phone: ${listing.get('Phone') || ''}. Email: ${listing.get('Email') || ''}. Attn: Jorge Zea - Broker - Realtor®.${buyerAdEN} Msg & data rates may apply. Reply STOP to opt out.`;
+        ? `Hola. La informacion que solicito para la propiedad: ${fullAddr}. Contacte a ${partyES} para visitas y preguntas al Telefono: ${listing.get('Phone') || ''}. Email: ${listing.get('Email') || ''}. Attn: Jorge Zea - Broker - Realtor.${buyerAdES}\n\nTarifas pueden aplicar. Responda STOP para cancelar.`
+        : `Hi. The info you requested for Property: ${fullAddr}. Contact ${partyEN} for showings and questions at Phone: ${listing.get('Phone') || ''}. Email: ${listing.get('Email') || ''}. Attn: Jorge Zea - Broker - Realtor.${buyerAdEN}\n\nMsg & data rates may apply. Reply STOP to opt out.`;
       await twilioClient.messages.create({
         from: process.env.TWILIO_PHONE_NUMBER, to: callerNumber, body: msgBody,
       }).catch(e => console.error('Caller SMS error:', e.message));
@@ -279,6 +293,7 @@ async function postCallSends(logId) {
     }
   } catch (err) {
     console.error('postCallSends error:', err.message || err);
+    postCallSentLogIds.delete(logId); // allow the /call-status backup to retry
   }
 }
 
@@ -299,7 +314,7 @@ function playTransferPrompt(twiml, lang, isRental, logId, matchId, callerNumber)
     : `The ${partyEN} handles showings and will answer any questions directly. Transferring your call right now. Press 1 or say text and I will also send you the ${partyEN}'s contact information in case we can't connect you now.`
   );
   // Always transfer even without SMS opt-in
-  twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}`);
+  twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}&type=Realtor`);
 }
 
 // ─── FCHB SPECIAL CASE ───────────────────────────────────────────────────────
@@ -517,7 +532,75 @@ app.post('/caller-type', (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // STEP 4 — AIRTABLE LOOKUP
 // ═══════════════════════════════════════════════════════════════════════════════
-app.post('/lookup-property', async (req, res) => {
+// Fetch + shape all listings. Started as soon as the caller finishes speaking
+// so the Airtable round-trip overlaps the "one moment" prompt / hold music.
+const listingsCache = new Map(); // callSid -> Promise<listings[]>
+function fetchListings() {
+  return base('ALL LISTINGS').select({
+    fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email',
+             'BAC Offered','Commission NOTES','Type','List Price','Notes','prop_id','Status','SMS_Recording_Consent'],
+  }).all().then(records => records.map(r => ({
+    id: r.id, prop_id: r.get('prop_id') || '',
+    address:     r.get('Address') || r.get('Street Address') || '',
+    city:        r.get('City') || '',
+    fullAddress: [r.get('Address') || r.get('Street Address'), r.get('City'), r.get('State'), r.get('Zip code')].filter(Boolean).join(', '),
+    name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
+    bac: r.get('BAC Offered') || '', commNotes: r.get('Commission NOTES') || '',
+    type: r.get('Type') || '', price: r.get('List Price') || '', notes: r.get('Notes') || '',
+    status: (r.get('Status') || '').toString(),
+  })));
+}
+
+// Front door: acknowledge, start the lookup in the background, play hold audio,
+// then redirect to /lookup-property-run which does the matching.
+app.post('/lookup-property', (req, res) => {
+  const speech  = (req.body.SpeechResult || '').toLowerCase().trim();
+  const digits  = (req.body.Digits || '').trim();
+  const spoken  = (req.body.SpeechResult || '').trim();
+  const lang    = req.query.lang || 'en';
+  const callerType = req.query.type || 'Buyer';
+  const callSid = req.query.callSid || req.body.CallSid;
+
+  // "Something else" / no address → skip the hold, existing logic handles it
+  if (!spoken || digits === '2' || /\b(something else|other|otro|otra|2)\b/.test(speech)) {
+    return handleLookup(req, res);
+  }
+
+  const entry = { done: false, promise: fetchListings() };
+  // mark done either way; the awaiting handler reports any error
+  entry.promise.then(() => { entry.done = true; }, () => { entry.done = true; });
+  listingsCache.set(callSid, entry);
+  setTimeout(() => listingsCache.delete(callSid), 5 * 60 * 1000).unref();
+
+  const twiml = new VoiceResponse();
+  say(twiml, lang, lang === 'es'
+    ? 'Gracias. Un momento mientras busco esa propiedad.'
+    : 'Thank you. One moment while I look that up.');
+  if (process.env.HOLD_MUSIC_URL) twiml.play(process.env.HOLD_MUSIC_URL);
+  twiml.redirect(`${process.env.BASE_URL}/lookup-property-run?lang=${lang}&type=${encodeURIComponent(callerType)}&callSid=${callSid}&spoken=${encodeURIComponent(spoken)}`);
+  res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/lookup-property-run', (req, res) => {
+  const callSid = req.query.callSid || req.body.CallSid;
+  const attempt = parseInt(req.query.attempt || '0', 10);
+  const entry   = listingsCache.get(callSid);
+  // Search still running after the first hold → hold again (max 2 extra rounds)
+  // instead of leaving dead air
+  if (entry && !entry.done && attempt < 2) {
+    const twiml = new VoiceResponse();
+    if (process.env.HOLD_MUSIC_URL) twiml.play(process.env.HOLD_MUSIC_URL);
+    else say(twiml, req.query.lang || 'en', (req.query.lang === 'es') ? 'Un momento mas.' : 'Just a moment more.');
+    const qs = new URLSearchParams({ ...req.query, attempt: String(attempt + 1) }).toString();
+    twiml.redirect(`${process.env.BASE_URL}/lookup-property-run?${qs}`);
+    return res.type('text/xml').send(twiml.toString());
+  }
+  req.body.SpeechResult = req.query.spoken || '';
+  req.body.Digits = '';
+  return handleLookup(req, res);
+});
+
+async function handleLookup(req, res) {
   const speech        = (req.body.SpeechResult || '').toLowerCase().trim();
   const digits        = (req.body.Digits || '').trim();
   const spokenAddress = req.body.SpeechResult || '';
@@ -552,21 +635,11 @@ app.post('/lookup-property', async (req, res) => {
   let logId = '';
 
   try {
-    const records = await base('ALL LISTINGS').select({
-      fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email',
-               'BAC Offered','Commission NOTES','Type','List Price','Notes','prop_id','Status','SMS_Recording_Consent'],
-    }).all();
-
-    const listings = records.map(r => ({
-      id: r.id, prop_id: r.get('prop_id') || '',
-      address:     r.get('Address') || r.get('Street Address') || '',
-      city:        r.get('City') || '',
-      fullAddress: [r.get('Address') || r.get('Street Address'), r.get('City'), r.get('State'), r.get('Zip code')].filter(Boolean).join(', '),
-      name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
-      bac: r.get('BAC Offered') || '', commNotes: r.get('Commission NOTES') || '',
-      type: r.get('Type') || '', price: r.get('List Price') || '', notes: r.get('Notes') || '',
-      status: (r.get('Status') || '').toString(),
-    }));
+    // Cap the wait at 8s → falls to /universal-fallback rather than a Twilio timeout drop
+    const pending  = listingsCache.get(callSid)?.promise || fetchListings();
+    const timeout  = new Promise((_, rej) => setTimeout(() => rej(new Error('listings lookup timed out')), 8000).unref());
+    const listings = await Promise.race([pending, timeout]);
+    listingsCache.delete(callSid);
 
     const fuse    = new Fuse(listings, { keys: ['address','fullAddress','city'], threshold: 0.45, includeScore: true });
     const results = fuse.search(spokenAddress.trim());
@@ -637,16 +710,29 @@ app.post('/lookup-property', async (req, res) => {
     twiml.redirect(`${process.env.BASE_URL}/universal-fallback?lang=${lang}&logId=${logId}&callSid=${callSid}`);
     res.type('text/xml').send(twiml.toString());
   }
-});
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STEP 4A — REALTOR FLOW
 // ═══════════════════════════════════════════════════════════════════════════════
+// Expand abbreviations so TTS reads "1198 SW 13th Ave" as words, not letters
+function speakableAddress(a) {
+  const dirs = { nw: 'northwest', ne: 'northeast', sw: 'southwest', se: 'southeast' };
+  const sfx  = { ave: 'Avenue', st: 'Street', dr: 'Drive', blvd: 'Boulevard', ct: 'Court', ln: 'Lane',
+                 rd: 'Road', ter: 'Terrace', cir: 'Circle', pl: 'Place' };
+  return (a || '')
+    .replace(/\b(nw|ne|sw|se)\b\.?/gi, m => dirs[m.replace('.', '').toLowerCase()])
+    .replace(/\b(ave|st|dr|blvd|ct|ln|rd|ter|cir|pl)\b\.?$/i, m => sfx[m.replace('.', '').toLowerCase()]);
+}
+
 function realtorFlow(res, twiml, { match, lang, callerNumber, callSid, logId }) {
   if (FCHB_EMAILS.includes((match.email || '').toLowerCase())) {
     return handleFCHB(res, twiml, { match, lang, logId });
   }
   const isRental = /rent|lease|alquil/i.test(match.type || '');
+  say(twiml, lang, lang === 'es'
+    ? `Perfecto, encontre ${speakableAddress(match.address)}.`
+    : `Great, I found ${speakableAddress(match.address)}.`);
 
   const gather = twiml.gather({
     input: 'speech dtmf', numDigits: 1, timeout: 8, speechTimeout: 'auto',
@@ -822,7 +908,7 @@ app.post('/flag-sms', async (req, res) => {
     await base('CALL LOG').update(logId, { Caller_SMS_Requested: true }).catch(console.error);
   }
   // Always proceed to transfer
-  twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}`);
+  twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}&type=${encodeURIComponent(req.query.type || 'Buyer')}`);
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -836,6 +922,9 @@ function buyerTenantFlow(res, twiml, { match, lang, callerNumber, callerType, ca
   const isRental = /rent|lease|alquil/i.test(match.type || '');
   const partyEN  = isRental ? 'landlord' : 'seller';
   const partyES  = isRental ? 'el propietario' : 'el vendedor';
+  say(twiml, lang, lang === 'es'
+    ? `Perfecto, encontre ${speakableAddress(match.address)}.`
+    : `Great, I found ${speakableAddress(match.address)}.`);
 
   const gather = twiml.gather({
     input: 'speech dtmf', numDigits: 1, timeout: 5, language: VOICE[lang].language,
@@ -849,7 +938,7 @@ function buyerTenantFlow(res, twiml, { match, lang, callerNumber, callerType, ca
     : `The ${partyEN} is handling showings directly. I will transfer your call right now. Press 1 or say text and I will also send you the ${partyEN}'s contact information in case we can't connect you now.`
   );
   // Transfer even without SMS opt-in
-  twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(match.id)}&logId=${logId}`);
+  twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(match.id)}&logId=${logId}&type=${encodeURIComponent(callerType)}`);
   res.type('text/xml').send(twiml.toString());
 }
 
@@ -860,11 +949,13 @@ app.post('/transfer-seller', async (req, res) => {
   const lang    = req.query.lang || 'en';
   const matchId = decodeURIComponent(req.query.matchId || '');
   const logId   = req.query.logId;
+  const callerType = req.query.type || 'Buyer';
   const twiml   = new VoiceResponse();
 
   try {
     const r           = await base('ALL LISTINGS').find(matchId);
     const sellerPhone = r.get('Phone') || '';
+    const sellerEmail = r.get('Email') || '';
     const listingType = (r.get('Type') || '').toLowerCase();
     const isRental    = /rent|lease/.test(listingType);
 
@@ -882,11 +973,11 @@ app.post('/transfer-seller', async (req, res) => {
         record: 'record-from-answer-dual-channel',
         recordingStatusCallback: `${process.env.BASE_URL}/second-leg-recording?logId=${logId}`,
         recordingStatusCallbackMethod: 'POST',
-        action: `${process.env.BASE_URL}/seller-unavailable?lang=${lang}&logId=${logId}`,
+        action: `${process.env.BASE_URL}/seller-unavailable?lang=${lang}&logId=${logId}&sellerEmail=${encodeURIComponent(sellerEmail)}`,
         method: 'POST',
       });
       dial.number({
-        url: `${process.env.BASE_URL}/seller-whisper?isRental=${isRental}`,
+        url: `${process.env.BASE_URL}/seller-whisper?isRental=${isRental}&callerType=${encodeURIComponent(callerType)}`,
         statusCallback: `${process.env.BASE_URL}/seller-status?logId=${logId}`,
         statusCallbackMethod: 'POST',
         statusCallbackEvent: 'answered completed',
@@ -905,19 +996,23 @@ app.post('/transfer-seller', async (req, res) => {
 
 // ─── SELLER WHISPER — always English ─────────────────────────────────────────
 app.post('/seller-whisper', (req, res) => {
-  const isRental = req.query.isRental === 'true';
-  const party    = isRental ? 'a potential tenant' : 'a potential buyer or Realtor';
+  const isRental   = req.query.isRental === 'true';
+  const callerType = req.query.callerType || 'Buyer';
+  const who = callerType === 'Realtor' ? 'a Realtor'
+    : (callerType === 'Tenant' || isRental) ? 'a potential tenant'
+    : 'a potential buyer';
   const twiml    = new VoiceResponse();
   const gather   = twiml.gather({
     input: 'speech dtmf', numDigits: 1, timeout: 8, speechTimeout: 'auto',
-    language: 'en-US', hints: 'yes, accept, ok, 1',
+    language: 'en-US', hints: 'yes, no, accept, ok, one, two, 1, 2',
     action: `${process.env.BASE_URL}/seller-consent`, method: 'POST',
   });
   gather.say(VOICE.en,
-    `Press 1 or say yes to accept an incoming lead call from SnapFlatFee.com about your listing. ` +
-    `The caller is ${party}. This call will be recorded for compliance purposes.`
+    `Hi, this is SnapFlatFee calling. We have ${who} on the line inquiring about your property. ` +
+    `Press 1 or say yes to connect. Or press 2 or say no, and we'll take a message and send it to you by email. ` +
+    `This call will be recorded.`
   );
-  say(twiml, 'en', 'No response received. The caller will be notified.');
+  say(twiml, 'en', 'No response received. We will take a message and email it to you.');
   twiml.hangup();
   res.type('text/xml').send(twiml.toString());
 });
@@ -926,12 +1021,13 @@ app.post('/seller-whisper', (req, res) => {
 app.post('/seller-consent', (req, res) => {
   const speech   = (req.body.SpeechResult || '').toLowerCase();
   const digits   = (req.body.Digits || '').trim();
-  const accepted = digits === '1' || /yes|ok|si|sí|aceptar|accept/.test(speech);
+  const declined = digits === '2' || /\b(no|nope|two)\b/.test(speech);
+  const accepted = !declined && (digits === '1' || /yes|ok|si|sí|aceptar|accept|one/.test(speech));
   const twiml    = new VoiceResponse();
   if (accepted) {
     res.type('text/xml').send('<Response></Response>'); // connect the call
   } else {
-    twiml.say(VOICE.en, 'Call not accepted. Thank you.');
+    twiml.say(VOICE.en, "No problem. We'll take a message and email it to you. Goodbye.");
     twiml.hangup();
     res.type('text/xml').send(twiml.toString());
   }
@@ -963,6 +1059,8 @@ app.post('/seller-status', async (req, res) => {
 app.post('/seller-unavailable', async (req, res) => {
   const lang         = req.query.lang || 'en';
   const logId        = req.query.logId || '';
+  const sellerEmail  = req.query.sellerEmail || '';
+  const sellerQS     = `&sellerEmail=${encodeURIComponent(sellerEmail)}&branch=seller`;
   const dialStatus   = req.body.DialCallStatus || '';
   const dialDuration = parseInt(req.body.DialCallDuration || '0', 10);
   const twiml        = new VoiceResponse();
@@ -989,7 +1087,7 @@ app.post('/seller-unavailable', async (req, res) => {
     input: 'speech dtmf', numDigits: 1, timeout: 8, speechTimeout: 'auto',
     language: VOICE[lang].language,
     hints: lang === 'es' ? 'mensaje, uno, 1' : 'message, one, 1',
-    action: `${process.env.BASE_URL}/unavailable-choice?lang=${lang}&logId=${logId}`,
+    action: `${process.env.BASE_URL}/unavailable-choice?lang=${lang}&logId=${logId}${sellerQS}`,
     method: 'POST',
   });
   if (lang === 'es') {
@@ -1005,7 +1103,7 @@ app.post('/seller-unavailable', async (req, res) => {
       'Or simply hang up and contact the seller using the information we texted you.'
     );
   }
-  twiml.redirect(`${process.env.BASE_URL}/voicemail?lang=${lang}&logId=${logId}&reason=seller_unavailable`);
+  twiml.redirect(`${process.env.BASE_URL}/voicemail?lang=${lang}&logId=${logId}&reason=seller_unavailable${sellerQS}`);
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -1015,11 +1113,12 @@ app.post('/unavailable-choice', (req, res) => {
   const speech = (req.body.SpeechResult || '').toLowerCase();
   const lang   = req.query.lang || 'en';
   const logId  = req.query.logId || '';
+  const sellerQS = `&sellerEmail=${encodeURIComponent(req.query.sellerEmail || '')}&branch=seller`;
   const twiml  = new VoiceResponse();
   const wantsMsg = digits === '1' || /\b(one|uno|message|mensaje|1)\b/.test(speech);
 
   if (wantsMsg) {
-    twiml.redirect(`${process.env.BASE_URL}/voicemail?lang=${lang}&logId=${logId}&reason=seller_unavailable`);
+    twiml.redirect(`${process.env.BASE_URL}/voicemail?lang=${lang}&logId=${logId}&reason=seller_unavailable${sellerQS}`);
   } else {
     say(twiml, lang, lang === 'es'
       ? 'Tiene toda la informacion en su telefono. Que tenga un buen dia.'
@@ -1073,7 +1172,7 @@ app.post('/voicemail', async (req, res) => {
   say(twiml, lang, lang === 'es' ? promptES : promptEN);
   twiml.record({
     maxLength: 120, transcribe: true,
-    transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=${attention}&branch=${req.query.branch || ''}`,
+    transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=${attention}&branch=${req.query.branch || ''}&sellerEmail=${encodeURIComponent(req.query.sellerEmail || '')}`,
     action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
   });
   res.type('text/xml').send(twiml.toString());
@@ -1120,6 +1219,20 @@ app.post('/voicemail-transcribed', async (req, res) => {
       subject: '⚠️ IVR Commission Branch Voicemail — Review Required',
       html: html('Commission Branch Voicemail', `<p><b>Call SID:</b> ${callSid}</p><p><b>Language:</b> ${lang === 'es' ? 'Spanish' : 'English'}</p>`),
     }).catch(console.error);
+  } else if (req.query.branch === 'seller' && sellerEmail) {
+    // Seller unavailable/declined → message goes to the seller, copy to SnapFlatFee
+    await sendEmail({
+      to: sellerEmail,
+      subject: 'You have a new message about your listing',
+      html: html('Message for you — SnapFlatFee.com', `<p><b>Call SID:</b> ${callSid}</p>`),
+    }).catch(console.error);
+    if (process.env.EMAIL_TO) {
+      await sendEmail({
+        to: process.env.EMAIL_TO,
+        subject: `📞 Seller-unavailable voicemail (copy) — ${ts}`,
+        html: html('Seller-unavailable voicemail — copy', `<p><b>Sent to seller:</b> ${sellerEmail}</p><p><b>Call SID:</b> ${callSid}</p>`),
+      }).catch(console.error);
+    }
   } else if (sellerEmail) {
     // FCHB: direct to seller
     await sendEmail({
@@ -1300,7 +1413,7 @@ async function notifySeller({ record, callerNumber, callerType, address, city })
   if (sellerPhone && airtableConsent) {
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER, to: sellerPhone,
-      body: `Lead alert from www.SnapFlatFee.com®. Call received about your property: ${address}, ${city}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}. Attn: Jorge Zea - Broker - Realtor® Msg & data rates may apply. Reply STOP to opt out.`,
+      body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${address}, ${city}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
     }).catch(console.error);
     return true;
   }
