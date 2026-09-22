@@ -62,6 +62,7 @@ bluelighthouse-ivr/
 | `VOICE_EN` *(optional)* | Overrides the default English Twilio voice (`Google.en-US-Chirp3-HD-Aoede`) |
 | `VOICE_ES` *(optional)* | Overrides the default Spanish Twilio voice (`Google.es-US-Chirp3-HD-Zephyr`) |
 | `HOLD_MUSIC_URL` *(optional)* | Public URL of a short (~3–5s) MP3 played after "One moment while I look that up" while the Airtable lookup runs. Unset = spoken line only |
+| `ALERT_EMAIL` *(optional)* | Where `alertError()` sends a "something failed" email (currently: `fetchRecordingAttachment` / `uploadRecordingToAirtable` failures). Falls back to `EMAIL_TO` if unset; if neither is set, failures only show in Railway logs |
 | `PORT` | Set automatically by Railway |
 
 **`EMAIL_TO` is load-bearing, not optional.** It's the fallback recipient in `/voicemail-transcribed` when a call has no property match. If it's unset in Railway, those voicemail notifications fail silently.
@@ -210,6 +211,14 @@ This means SMS history the dashboard shows is not stored in Airtable — it's re
 
 ### FCHB (Florida Cash Home Buyers)
 Emails `kevin@floridacashhomebuyers.com` or `alejandro@floridacashhomebuyers.com` → skip all transfer logic, go straight to voicemail, email transcript directly to that seller. Checked AFTER address match and AFTER Realtor/Buyer branch decision, inside `realtorFlow` and `buyerTenantFlow`.
+
+### Voicemail recordings are attached, not linked
+Twilio's `RecordingUrl` requires the Twilio Account SID/Auth Token (Basic Auth) to view — a bare link in an email is a dead end for the seller or `snapflatfee2`, who don't have Twilio Console access. `fetchRecordingAttachment(recordingUrl)` fetches `${recordingUrl}.mp3` server-side with those credentials, base64-encodes it, and `sendEmail()` passes it through to Resend as an attachment. Used in `/voicemail-transcribed` and `/afterhours-transcribed`. Voicemails are capped at 120s (`twiml.record maxLength`), so the file stays small. If the fetch fails for any reason, the email falls back to the old (still auth-gated) link, with a note in the email — see the alert-email note below, so a failure is visible, not silent.
+
+The same base64 is also pushed straight into Airtable's **`Voicemail File`** attachment field on the CALL LOG record (`uploadRecordingToAirtable()`), via Airtable's `content.airtable.com/.../uploadAttachment` endpoint — this one takes the file content directly, so it works even though the source URL is auth-gated (a normal `{url}` attachment would require Airtable's own servers to fetch it, which they can't). Field is matched by name, not ID — if "Voicemail File" is ever renamed in Airtable, update the string in `uploadRecordingToAirtable()`. This has not yet been confirmed against a live test call — verify a recording actually lands there before relying on it. The old `Voicemail_URL` field is still written too (unaffected, and still only useful to Jorge, who has Twilio Console access); `Second_Leg_Recording_URL` (full transferred-call recordings) is not yet pushed through this same attachment path.
+
+### Error alerts
+Railway has no built-in "email me when this log line appears" feature, so `alertError(context, err)` sends its own email via Resend (to `ALERT_EMAIL`, falling back to `EMAIL_TO`) whenever `fetchRecordingAttachment` or `uploadRecordingToAirtable` fails, in addition to the Railway log line. Not wired into every `console.error` in the file — just these two so far.
 
 ### Lookup flow (hold + "Great, I found…")
 `/lookup-property` is now a front door: it starts the Airtable listings fetch in the background (`fetchListings()`, cached per CallSid), says "One moment while I look that up" (+ `HOLD_MUSIC_URL` if set), then redirects to `/lookup-property-run`, which does the Fuse match (`handleLookup()`). "Something else"/no-address input skips the hold. After a match, Realtor and Buyer flows open with "Great, I found {address}" (`speakableAddress()` expands SW/Ave etc. for TTS). If the search outlasts the first hold, `/lookup-property-run` holds again (up to 2 extra rounds via `attempt=`), and the wait is capped at 8s → `/universal-fallback`. Ringing while connecting to the seller can't be replaced with music without moving to `<Conference>`.

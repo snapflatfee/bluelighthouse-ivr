@@ -182,7 +182,7 @@ const claude        = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // ─── Email via Resend (Railway blocks SMTP port 587 — use HTTP API instead) ──
 // Sign up free at resend.com, get API key, add RESEND_API_KEY to Railway env vars
 // Sends FROM noreply@snapflatfee.com, replies go to snapflatfee@gmail.com
-async function sendEmail({ to, subject, html }) {
+async function sendEmail({ to, subject, html, attachments }) {
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -195,6 +195,7 @@ async function sendEmail({ to, subject, html }) {
       to: Array.isArray(to) ? to : [to],
       subject,
       html,
+      ...(attachments && attachments.length ? { attachments } : {}),
     }),
   });
   if (!res.ok) {
@@ -202,6 +203,75 @@ async function sendEmail({ to, subject, html }) {
     throw new Error(`Resend error ${res.status}: ${err}`);
   }
   return res.json();
+}
+
+// ─── Error alert email ────────────────────────────────────────────────────────
+// Railway has no built-in "email me on this log line" feature, so when a step
+// below fails, send ourselves an email via the same Resend path rather than
+// relying on someone noticing it in Railway logs. Set ALERT_EMAIL in Railway;
+// falls back to EMAIL_TO if unset. If neither is set, this just logs — same as
+// before.
+async function alertError(context, err) {
+  const message = (err && err.message) || String(err);
+  console.error(`${context}:`, message);
+  const to = process.env.ALERT_EMAIL || process.env.EMAIL_TO;
+  if (!to) return;
+  try {
+    await sendEmail({
+      to, subject: `⚠️ IVR error: ${context}`,
+      html: `<p><b>${context}</b></p><p>${message.replace(/</g, '&lt;')}</p><p>Time: ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })}</p>`,
+    });
+  } catch (e) {
+    console.error('alertError: failed to send alert email:', e.message);
+  }
+}
+
+// ─── Recording as an email attachment ────────────────────────────────────────
+// Twilio recording URLs (RecordingUrl) require Twilio Account SID/Auth Token
+// Basic Auth to view — a bare link in an email is a dead end for the seller or
+// snapflatfee2, who don't have Twilio Console access. Fetch the audio here
+// (server-side, with our own Twilio credentials) and attach it to the email
+// instead, so it just plays from the inbox. Voicemails are capped at 120s
+// (see twiml.record maxLength), so this is a small file — safe to attach.
+async function fetchRecordingAttachment(recordingUrl, filename = 'voicemail.mp3') {
+  if (!recordingUrl) return null;
+  try {
+    const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+    const res  = await fetch(`${recordingUrl}.mp3`, { headers: { Authorization: `Basic ${auth}` } });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const buf  = Buffer.from(await res.arrayBuffer());
+    return [{ filename, content: buf.toString('base64') }];
+  } catch (err) {
+    await alertError('fetchRecordingAttachment', err);
+    return null; // caller falls back to the (Twilio-login-gated) link
+  }
+}
+
+// ─── Recording into Airtable's own attachment field ──────────────────────────
+// Airtable's uploadAttachment endpoint (content.airtable.com — a separate
+// domain from the regular API, not wrapped by the old `airtable` npm client)
+// takes base64 file content directly, so it works even though the source
+// Twilio URL is auth-gated — unlike a normal {url}-style attachment, Airtable
+// never has to fetch anything itself. Field is matched by NAME ("Voicemail
+// File"); if that field is ever renamed in Airtable, update this to match.
+async function uploadRecordingToAirtable(recordId, base64, filename = 'voicemail.mp3') {
+  if (!recordId || !base64) return false;
+  try {
+    const url = `https://content.airtable.com/v0/${process.env.AIRTABLE_BASE_ID}/${recordId}/${encodeURIComponent('Voicemail File')}/uploadAttachment`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.AIRTABLE_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ contentType: 'audio/mpeg', file: base64, filename }),
+    });
+    if (!res.ok) throw new Error(`Airtable uploadAttachment ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    return true;
+  } catch (err) {
+    await alertError('uploadRecordingToAirtable', err);
+    return false;
+  }
 }
 
 const VOICE = {
@@ -1203,11 +1273,16 @@ app.post('/voicemail-transcribed', async (req, res) => {
     }).catch(console.error);
   }
 
-  const ts  = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  const ts          = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  const attachments = await fetchRecordingAttachment(recordingUrl);
+  if (logId && attachments) uploadRecordingToAirtable(logId, attachments[0].content);
+  const recordingLine = attachments
+    ? `<p><b>Recording:</b> attached to this email (voicemail.mp3)</p>`
+    : `<p><b>Recording:</b> <a href="${recordingUrl}">Listen</a> (requires Twilio Console login — attachment failed to fetch, see Railway logs)</p>`;
   const html = (title, extra) => `<div style="font-family:Arial,sans-serif;max-width:600px;">
     <h2 style="color:#003087;">📞 ${title}</h2>
     <p><b>Time:</b> ${ts}</p>${extra}
-    <p><b>Recording:</b> <a href="${recordingUrl}">Listen</a></p>
+    ${recordingLine}
     <h3>Transcript</h3>
     <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript || 'Pending...'}</p>
     <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p></div>`;
@@ -1218,6 +1293,7 @@ app.post('/voicemail-transcribed', async (req, res) => {
       from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
       subject: '⚠️ IVR Commission Branch Voicemail — Review Required',
       html: html('Commission Branch Voicemail', `<p><b>Call SID:</b> ${callSid}</p><p><b>Language:</b> ${lang === 'es' ? 'Spanish' : 'English'}</p>`),
+      attachments,
     }).catch(console.error);
   } else if (req.query.branch === 'seller' && sellerEmail) {
     // Seller unavailable/declined → message goes to the seller, copy to SnapFlatFee
@@ -1225,12 +1301,14 @@ app.post('/voicemail-transcribed', async (req, res) => {
       to: sellerEmail,
       subject: 'You have a new message about your listing',
       html: html('Message for you — SnapFlatFee.com', `<p><b>Call SID:</b> ${callSid}</p>`),
+      attachments,
     }).catch(console.error);
     if (process.env.EMAIL_TO) {
       await sendEmail({
         to: process.env.EMAIL_TO,
         subject: `📞 Seller-unavailable voicemail (copy) — ${ts}`,
         html: html('Seller-unavailable voicemail — copy', `<p><b>Sent to seller:</b> ${sellerEmail}</p><p><b>Call SID:</b> ${callSid}</p>`),
+        attachments,
       }).catch(console.error);
     }
   } else if (sellerEmail) {
@@ -1239,6 +1317,7 @@ app.post('/voicemail-transcribed', async (req, res) => {
       from: process.env.EMAIL_FROM, to: sellerEmail,
       subject: 'Voicemail received for your listing',
       html: html('Voicemail — Blue Lighthouse Realty', `<p><b>Call SID:</b> ${callSid}</p>`),
+      attachments,
     }).catch(console.error);
   } else {
     // Normal flow
@@ -1247,6 +1326,7 @@ app.post('/voicemail-transcribed', async (req, res) => {
       to: isAttention ? 'snapflatfee2@gmail.com' : process.env.EMAIL_TO,
       subject: isAttention ? 'IVR — Voicemail needs attention' : `📞 New Voicemail — ${ts}`,
       html: html('New Voicemail — Blue Lighthouse Realty', `<p><b>Language:</b> ${lang === 'es' ? 'Spanish' : 'English'}</p><p><b>Call SID:</b> ${callSid}</p>`),
+      attachments,
     }).catch(console.error);
   }
   res.sendStatus(200);
@@ -1275,15 +1355,24 @@ app.post('/afterhours-transcribed', async (req, res) => {
     const fuse    = new Fuse(listings, { keys: ['address','fullAddress','city'], threshold: 0.45 });
     const results = fuse.search(transcript);
     const match   = results.length > 0 ? results[0].item : null;
+    const attachments   = await fetchRecordingAttachment(recordingUrl);
+    const recordingLine = attachments
+      ? `<p>Recording attached to this email (voicemail.mp3)</p>`
+      : `<p><a href="${recordingUrl}">Listen</a> (requires Twilio Console login — attachment failed to fetch)</p>`;
 
-    await base('CALL LOG').create({
-      Name: `After-Hours ${new Date().toISOString()}`, Call_ID: callSid,
-      Call_Date: new Date().toISOString(), Caller_Number: callerNumber,
-      Caller_Type: 'Unknown', Property_Address: transcript, Transcript: transcript,
-      Voicemail_URL: recordingUrl, Call_Disposition: match ? 'Voicemail Left' : 'No Match Found',
-      Real_Address: match ? match.fullAddress : '',
-      Listing_Link: match ? [match.id] : undefined,
-    }).catch(e => console.error('After-hours log error:', e));
+    let afterHoursLogId = '';
+    try {
+      const logRecord = await base('CALL LOG').create({
+        Name: `After-Hours ${new Date().toISOString()}`, Call_ID: callSid,
+        Call_Date: new Date().toISOString(), Caller_Number: callerNumber,
+        Caller_Type: 'Unknown', Property_Address: transcript, Transcript: transcript,
+        Voicemail_URL: recordingUrl, Call_Disposition: match ? 'Voicemail Left' : 'No Match Found',
+        Real_Address: match ? match.fullAddress : '',
+        Listing_Link: match ? [match.id] : undefined,
+      });
+      afterHoursLogId = logRecord.id;
+    } catch (e) { console.error('After-hours log error:', e); }
+    if (afterHoursLogId && attachments) uploadRecordingToAirtable(afterHoursLogId, attachments[0].content);
 
     if (match && match.email) {
       await sendEmail({
@@ -1294,11 +1383,12 @@ app.post('/afterhours-transcribed', async (req, res) => {
           <p>Dear ${match.name || 'Seller'},</p>
           <p>We received an after-hours call about your property at <strong>${match.fullAddress}</strong>.</p>
           <p>Caller: <strong>${callerNumber}</strong></p>
-          <p><a href="${recordingUrl}">Listen to voicemail</a></p>
+          ${recordingLine}
           <h3>Transcript</h3>
           <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript}</p>
           <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p>
         </div>`,
+        attachments,
       }).catch(console.error);
     } else {
       await sendEmail({
@@ -1307,17 +1397,20 @@ app.post('/afterhours-transcribed', async (req, res) => {
         html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
           <h2 style="color:#003087;">📞 After-Hours Voicemail — No Match</h2>
           <p><b>Time:</b> ${ts}</p><p><b>Caller:</b> ${callerNumber}</p>
-          <p><a href="${recordingUrl}">Listen</a></p>
+          ${recordingLine}
           <p>${transcript || '(no transcript)'}</p>
         </div>`,
+        attachments,
       }).catch(console.error);
     }
   } catch (err) {
     console.error('After-hours processing error:', err);
+    const attachments = await fetchRecordingAttachment(recordingUrl).catch(() => null);
     await sendEmail({
       from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
       subject: 'IVR — After-hours call (error)',
-      html: `<p>Error processing. Caller: ${callerNumber}. <a href="${recordingUrl}">Listen</a>. Transcript: ${transcript}</p>`,
+      html: `<p>Error processing. Caller: ${callerNumber}. ${attachments ? 'Recording attached.' : `<a href="${recordingUrl}">Listen</a> (requires Twilio Console login)`} Transcript: ${transcript}</p>`,
+      attachments,
     }).catch(console.error);
   }
   res.sendStatus(200);
