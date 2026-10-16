@@ -98,7 +98,7 @@ SMS:
 - Address / Street Address, City, State, Zip code
 - Name, Phone, Email (seller)
 - Status (Active/Pending = live), Type (Sale vs Rent)
-- prop_id (fallback ID when Listing_Link doesn't stick)
+- UniqueID (formerly prop_id; fallback ID when Listing_Link doesn't stick)
 - SMS_Recording_Consent (Yes I Agree / No I Don't Agree)
 - BAC Offered, Commission NOTES
 

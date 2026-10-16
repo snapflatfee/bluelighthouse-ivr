@@ -200,7 +200,7 @@ async function postCallSends(logId) {
         return;
       }
       const recs = await base('ALL LISTINGS').select({
-        filterByFormula: `{prop_id}="${propId}"`,
+        filterByFormula: `{UniqueID}="${propId}"`,
         maxRecords: 1,
         fields: ['Address','Street Address','City','State','Zip code','Type','Phone','Email','Name','SMS_Recording_Consent'],
       }).firstPage();
@@ -291,7 +291,7 @@ async function handleFCHB(res, twiml, { match, lang, logId }) {
 app.get('/test-airtable', async (req, res) => {
   const result = {};
   try {
-    await base('ALL LISTINGS').select({ maxRecords: 1, fields: ['prop_id'] }).firstPage();
+    await base('ALL LISTINGS').select({ maxRecords: 1, fields: ['UniqueID'] }).firstPage();
     result.all_listings_ok = true;
   } catch (err) { result.all_listings_ok = false; console.error('test-airtable ALL LISTINGS:', err.message); }
   try {
@@ -484,9 +484,9 @@ const listingsCache = new Map(); // callSid -> Promise<listings[]>
 function fetchListings() {
   return base('ALL LISTINGS').select({
     fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email',
-             'BAC Offered','Commission NOTES','Type','List Price','Notes','prop_id','Status','SMS_Recording_Consent'],
+             'BAC Offered','Commission NOTES','Type','List Price','Notes','UniqueID','Status','SMS_Recording_Consent'],
   }).all().then(records => records.map(r => ({
-    id: r.id, prop_id: r.get('prop_id') || '',
+    id: r.id, prop_id: r.get('UniqueID') || '',
     address:     r.get('Address') || r.get('Street Address') || '',
     city:        r.get('City') || '',
     fullAddress: [r.get('Address') || r.get('Street Address'), r.get('City'), r.get('State'), r.get('Zip code')].filter(Boolean).join(', '),

@@ -104,7 +104,7 @@ Key fields used by the IVR:
 - `Name`, `Phone`, `Email` — seller contact info
 - `Status` — singleSelect (`Active`, `Stand By`, `Pending`, `Closed`, `Temp Off`, `Canceled`, `Upload`, `Abandoned`, `Wait for Commission`). Code treats `Active` or `Pending` = live; anything else = "no longer available"
 - `Type` — singleSelect, actual choices are `Sale` / `Rent` (not "Rent/Lease" — code matches via `/rent|lease|alquil/i` so it also tolerates "Lease" if that value is ever added)
-- `prop_id` — unique ID (e.g. `ONBRD_00185`) used as fallback when `Listing_Link` is empty
+- `UniqueID` — unique ID (e.g. `ONBRD_00185`), used as fallback when `Listing_Link` is empty. **Renamed from `prop_id` in Airtable between 2026-09-21 and 2026-10-15**; the IVR asks Airtable for fields by name, so a renamed field breaks every lookup — check `/test-airtable` after any Airtable rename. (CALL LOG still has its own `Prop_ID` field, unchanged.)
 - `SMS_Recording_Consent` — singleSelect, actual choices are `Yes I Agree` / `No I Don't Agree`. Code does an exact-string check for `'Yes I Agree'` (`server.js:1270`) — drives seller SMS in `notifySeller()`. There's a separate `Call_Recording_Consent` field on this table too, but it's not referenced anywhere in server.js.
 - `BAC Offered`, `Commission NOTES` — for Realtor disclosure
 - `Email` — for FCHB special case routing (see below)
