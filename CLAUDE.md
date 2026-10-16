@@ -28,7 +28,6 @@ A cloud-hosted IVR (Interactive Voice Response) system that answers inbound real
 ```
 bluelighthouse-ivr/
 ├── server.js          ← THE entire IVR application (all routes, all logic)
-├── dashboard.html     ← Call log + SMS conversations dashboard UI (served at /dashboard)
 ├── package.json       ← Dependencies
 ├── railway.toml       ← Railway deploy config (Nixpacks, npm start, restart on failure)
 ├── README.md          ← Public-facing repo overview
@@ -179,31 +178,20 @@ HTTP POST to Resend API. Sends from `noreply@snapflatfee.com`, reply-to `snapfla
 
 ---
 
-## SMS Conversation Dashboard
+## SMS Conversation Dashboard — moved to Manager Dashboard
 
-Separate from the voice IVR flow — a two-way texting inbox served alongside the call log, all through `dashboard.html` at `/dashboard`.
+The two-way texting inbox (`/dashboard`, `dashboard.html`, `/api/conversations`, `/api/messages`, `/api/send`, `/api/hide-conversation`) was **removed from this IVR on 2026-10-15**. It had no login, so anyone with the Railway URL could read every SMS thread and send texts from the A2P-registered number. Jorge reads and replies to texts in the **Messages tab of the Manager Dashboard** (`../manager_dashboard`, its own repo/Railway service with its own login). Don't re-add these routes here.
+
+What stays in this IVR:
 
 ```
-/sms-inbound            POST — Twilio webhook for inbound SMS replies.
-                         Logs the message into the matching CALL LOG record's
-                         Notes field (matched by Caller_Number, most recent).
-                         No auto-reply; message just appears in the dashboard.
-
-/api/conversations      GET  — Builds the conversation list by merging Twilio's
-                         full message history (both directions, via REST API)
-                         with CALL LOG context (caller type, matched property).
-
-/api/messages           GET  — Full message thread for one conversation.
-
-/api/send                POST — Sends an outbound SMS via Twilio REST API
-                         (used by the dashboard's reply box).
-
-/api/hide-conversation  POST — No-op placeholder; Twilio doesn't support
-                         deleting message history this way. "Hiding" a
-                         conversation is handled client-side via localStorage.
+/sms-inbound            POST — Twilio webhook for inbound SMS replies (keep it
+                         set on the Twilio number). Logs the message into the
+                         matching CALL LOG record's Notes field (matched by
+                         Caller_Number, most recent). No auto-reply.
 ```
 
-This means SMS history the dashboard shows is not stored in Airtable — it's read live from Twilio each time, with Airtable only used to attach caller-type/property context.
+SMS history is not stored in Airtable — the Manager Dashboard reads it live from Twilio.
 
 ---
 
@@ -293,7 +281,7 @@ All from `noreply@snapflatfee.com`, reply-to `snapflatfee@gmail.com`.
 ```
 https://elegant-forgiveness-production-bd35.up.railway.app/test-airtable
 ```
-Returns JSON showing env vars set, tables accessible, and sample records.
+Returns only yes/no JSON (`all_listings_ok`, `call_log_ok`). It's public, so it no longer shows env vars, key prefixes or sample records — on `false`, the reason is in the Railway logs (`test-airtable ALL LISTINGS:` / `test-airtable CALL LOG:`).
 
 **Railway logs:** Railway → elegant-forgiveness → Deployments → View Logs
 

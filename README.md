@@ -15,7 +15,7 @@
 - Records calls (dual-channel) and transcribes voicemails
 - Emails voicemail transcripts and call notifications to the office
 - Logs every call to the Airtable `CALL LOG` table
-- Includes a two-way SMS conversation dashboard (`/dashboard`) for replying to callers/sellers by text
+- Logs inbound SMS replies to the matching `CALL LOG` record (the texting inbox lives in the separate Manager Dashboard)
 
 This is a **live production system**. See `CLAUDE.md` for the full architecture, call-flow diagram, and environment variable reference.
 
@@ -84,16 +84,11 @@ Voice (IVR) flow — see `CLAUDE.md` for the full call-flow diagram:
 | POST /afterhours-lang, /afterhours-transcribed | After-hours flow |
 | POST /call-status | Twilio call-status webhook (backup trigger for post-call notifications) |
 
-SMS conversation dashboard:
+SMS:
 
 | Endpoint | Purpose |
 |---|---|
-| POST /sms-inbound | Twilio webhook for inbound SMS replies |
-| GET /api/conversations | Conversation list (merges Twilio history + CALL LOG context) |
-| GET /api/messages | Full thread for one conversation |
-| POST /api/send | Sends an outbound SMS |
-| POST /api/hide-conversation | Hides a conversation client-side (no-op server-side) |
-| GET /dashboard | Serves the dashboard UI |
+| POST /sms-inbound | Twilio webhook for inbound SMS replies (logged to CALL LOG) |
 
 ---
 

@@ -20,10 +20,9 @@ const path = require('path');
 // Static audio (e.g. hold music). Put files in ./audio, reference as BASE_URL/audio/<file>
 app.use('/audio', express.static(path.join(__dirname, 'audio')));
 
-// ─── Dashboard UI ────────────────────────────────────────────────────────────
-app.get('/dashboard', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dashboard.html'));
-});
+// SMS dashboard (/dashboard + /api/*) moved to the Manager Dashboard's
+// Messages tab (separate repo with its own login) — removed here 2026-10-15
+// because it was publicly reachable with no auth.
 
 // ─── INBOUND SMS — replies from callers/sellers ──────────────────────────────
 app.post('/sms-inbound', async (req, res) => {
@@ -50,128 +49,8 @@ app.post('/sms-inbound', async (req, res) => {
     console.error('SMS inbound log error:', err);
   }
 
-  // No auto-reply — message just gets logged and appears in /dashboard
+  // No auto-reply — message just gets logged; read/reply in the Manager Dashboard's Messages tab
   res.type('text/xml').send('<Response></Response>');
-});
-
-// ─── API: Get all conversations (from Twilio message history + CALL LOG context) ──
-app.get('/api/conversations', async (req, res) => {
-  try {
-    // 1. Pull ALL real conversations from Twilio (both directions)
-    const sent = await twilioClient.messages.list({ from: process.env.TWILIO_PHONE_NUMBER, limit: 200 });
-    const received = await twilioClient.messages.list({ to: process.env.TWILIO_PHONE_NUMBER, limit: 200 });
-    const allMsgs = [...sent, ...received];
-
-    // 2. Pull CALL LOG for context (caller type, property) — best-effort match
-    const records = await base('CALL LOG').select({
-      sort: [{ field: 'Call_Date', direction: 'desc' }],
-      maxRecords: 300,
-      fields: ['Call_Date','Caller_Number','Caller_Type','Real_Address','Property_Address'],
-    }).all();
-
-    const contextByNumber = new Map();
-    records.forEach(r => {
-      const num = r.get('Caller_Number') || '';
-      if (num && !contextByNumber.has(num)) {
-        contextByNumber.set(num, {
-          type:     r.get('Caller_Type') || 'unknown',
-          property: r.get('Real_Address') || r.get('Property_Address') || '',
-        });
-      }
-    });
-
-    // 3. Build conversation list keyed by the OTHER party's number
-    const convMap = new Map();
-    allMsgs.forEach(m => {
-      const isOutbound = m.direction && m.direction.startsWith('outbound');
-      const otherNumber = isOutbound ? m.to : m.from;
-      if (!otherNumber || otherNumber === process.env.TWILIO_PHONE_NUMBER) return;
-
-      const existing = convMap.get(otherNumber);
-      const msgTime = new Date(m.dateSent || m.dateCreated);
-
-      if (!existing || msgTime > new Date(existing.lastTime)) {
-        const ctx = contextByNumber.get(otherNumber) || {};
-        convMap.set(otherNumber, {
-          number:      otherNumber,
-          type:        ctx.type || 'unknown',
-          property:    ctx.property || '',
-          lastMessage: (m.body || '').slice(0, 80),
-          lastTime:    msgTime.toISOString(),
-          unread:      false,
-        });
-      }
-    });
-
-    const conversations = Array.from(convMap.values())
-      .sort((a, b) => new Date(b.lastTime) - new Date(a.lastTime));
-
-    res.json({ conversations });
-  } catch (err) {
-    console.error('Conversations API error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── API: Delete (hide) a conversation thread ────────────────────────────────
-// Note: Twilio does not support deleting message history via this approach in
-// a way that removes it from the carrier record. This endpoint is a no-op
-// placeholder; actual hiding is handled client-side via localStorage.
-app.post('/api/hide-conversation', (req, res) => {
-  res.json({ success: true });
-});
-
-// ─── API: Get messages for a specific number (Twilio) ───────────────────────
-app.get('/api/messages', async (req, res) => {
-  try {
-    const number = req.query.number;
-    if (!number) return res.status(400).json({ error: 'number required' });
-
-    const messages = await twilioClient.messages.list({
-      to:   number,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      limit: 50,
-    });
-
-    const inbound = await twilioClient.messages.list({
-      from: number,
-      to:   process.env.TWILIO_PHONE_NUMBER,
-      limit: 50,
-    });
-
-    const all = [...messages, ...inbound]
-      .sort((a, b) => new Date(a.dateSent) - new Date(b.dateSent));
-
-    res.json({ messages: all.map(m => ({
-      sid:       m.sid,
-      direction: m.direction,
-      body:      m.body,
-      dateSent:  m.dateSent,
-      status:    m.status,
-    }))});
-  } catch (err) {
-    console.error('Messages API error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── API: Send a message ─────────────────────────────────────────────────────
-app.post('/api/send', async (req, res) => {
-  try {
-    const { to, body } = req.body;
-    if (!to || !body) return res.status(400).json({ error: 'to and body required' });
-
-    const msg = await twilioClient.messages.create({
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to,
-      body,
-    });
-
-    res.json({ success: true, sid: msg.sid });
-  } catch (err) {
-    console.error('Send API error:', err);
-    res.status(500).json({ error: err.message });
-  }
 });
 
 const twilioClient  = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -406,22 +285,19 @@ async function handleFCHB(res, twiml, { match, lang, logId }) {
   return res.type('text/xml').send(twiml.toString());
 }
 
-// ─── AIRTABLE TEST ────────────────────────────────────────────────────────────
+// ─── AIRTABLE HEALTH CHECK ────────────────────────────────────────────────────
+// Public, so it only answers yes/no — no keys, IDs, record data or error text.
+// Details go to the Railway logs.
 app.get('/test-airtable', async (req, res) => {
-  const result = {
-    AIRTABLE_API_KEY: process.env.AIRTABLE_API_KEY ? `set (${process.env.AIRTABLE_API_KEY.slice(0,12)}...)` : 'MISSING',
-    AIRTABLE_BASE_ID: process.env.AIRTABLE_BASE_ID || 'MISSING',
-    BASE_URL:         process.env.BASE_URL || 'MISSING',
-  };
+  const result = {};
   try {
-    const recs = await base('ALL LISTINGS').select({ maxRecords: 2, fields: ['prop_id','Status'] }).firstPage();
+    await base('ALL LISTINGS').select({ maxRecords: 1, fields: ['prop_id'] }).firstPage();
     result.all_listings_ok = true;
-    result.sample = recs.map(r => ({ id: r.id, prop_id: r.get('prop_id'), status: r.get('Status') }));
-  } catch (err) { result.all_listings_ok = false; result.all_listings_error = err.message; result.status_code = err.statusCode; }
+  } catch (err) { result.all_listings_ok = false; console.error('test-airtable ALL LISTINGS:', err.message); }
   try {
     await base('CALL LOG').select({ maxRecords: 1, fields: ['Name'] }).firstPage();
     result.call_log_ok = true;
-  } catch (err) { result.call_log_ok = false; result.call_log_error = err.message; }
+  } catch (err) { result.call_log_ok = false; console.error('test-airtable CALL LOG:', err.message); }
   res.json(result);
 });
 
