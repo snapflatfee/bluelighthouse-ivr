@@ -17,6 +17,34 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 const path = require('path');
 
+// ─── TWILIO SIGNATURE CHECK ──────────────────────────────────────────────────
+// Every POST route in this file is a Twilio webhook, so all POSTs must carry a
+// valid X-Twilio-Signature. Twilio signs the public URL it called; Railway's
+// proxy hides that, so it's rebuilt from BASE_URL + the path/query.
+// TWILIO_VALIDATE (Railway env var): "on" (default) rejects bad signatures,
+// "log" only logs them, "off" skips the check — the quick kill switch if calls break.
+const TWILIO_VALIDATE = (process.env.TWILIO_VALIDATE || 'on').toLowerCase();
+app.use((req, res, next) => {
+  if (req.method !== 'POST' || TWILIO_VALIDATE === 'off') return next();
+  const url = `${(process.env.BASE_URL || '').replace(/\/+$/, '')}${req.originalUrl}`;
+  const ok  = twilio.validateRequest(
+    process.env.TWILIO_AUTH_TOKEN || '',
+    req.get('X-Twilio-Signature') || '',
+    url,
+    req.body || {}
+  );
+  if (ok) return next();
+  console.warn(`Twilio signature check failed (${TWILIO_VALIDATE}): POST ${url}`);
+  if (TWILIO_VALIDATE === 'log') return next();
+  res.status(403).send('Forbidden');
+});
+
+// Airtable formula string literal: escapes \ " ' and wraps in double quotes,
+// so request values can't break out of the formula.
+function airtableStr(value) {
+  return `"${String(value ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/'/g, "\\'")}"`;
+}
+
 // Static audio (e.g. hold music). Put files in ./audio, reference as BASE_URL/audio/<file>
 app.use('/audio', express.static(path.join(__dirname, 'audio')));
 
@@ -34,7 +62,7 @@ app.post('/sms-inbound', async (req, res) => {
   // Log to CALL LOG if a recent record exists for this number, else just log to console
   try {
     const records = await base('CALL LOG').select({
-      filterByFormula: `{Caller_Number} = '${from}'`,
+      filterByFormula: `{Caller_Number} = ${airtableStr(from)}`,
       sort: [{ field: 'Call_Date', direction: 'desc' }],
       maxRecords: 1,
     }).firstPage();
@@ -200,7 +228,7 @@ async function postCallSends(logId) {
         return;
       }
       const recs = await base('ALL LISTINGS').select({
-        filterByFormula: `{UniqueID}="${propId}"`,
+        filterByFormula: `{UniqueID}=${airtableStr(propId)}`,
         maxRecords: 1,
         fields: ['Address','Street Address','City','State','Zip code','Type','Phone','Email','Name','SMS_Recording_Consent'],
       }).firstPage();
@@ -312,7 +340,7 @@ app.post('/call-status', async (req, res) => {
   if (['completed','busy','no-answer','failed','canceled'].includes(callStatus)) {
     try {
       const records = await base('CALL LOG').select({
-        filterByFormula: `{Call_ID}="${callSid}"`, maxRecords: 1,
+        filterByFormula: `{Call_ID}=${airtableStr(callSid)}`, maxRecords: 1,
       }).firstPage();
       if (records.length) setImmediate(() => postCallSends(records[0].id));
     } catch (err) { console.error('call-status error:', err.message); }
