@@ -229,18 +229,63 @@ async function saveRecordingToAirtable(recordId, recordingUrl, field, filename, 
 }
 
 // The recording of the call with the seller. Twilio's callback AND our own look-up (below) can both
-// deliver the same recording, so each one is only saved once.
-const savedRecordingSids = new Set();
+// deliver the same recording, so each one is only saved (and emailed) once.
+const savedRecordingSids   = new Set();
+const emailedRecordingSids = new Set();
 const recordingSidOf = (url) => (/\/Recordings\/(RE[0-9a-f]{32})/i.exec(url || '') || [])[1] || url;
-async function saveCallRecording(logId, recordingUrl, via) {
+const CALL_RECORDING_EMAIL_MAX_BYTES = 25 * 1024 * 1024; // email limit is ~40 MB after base64; stay well under
+
+// Jorge always gets the full call recording by email ("IVR - Completed Call Recording"), independent of Airtable.
+async function emailCompletedCallRecording(logId, recordingUrl, durationSecs) {
+  const sid = recordingSidOf(recordingUrl);
+  if (emailedRecordingSids.has(sid)) return;
+  emailedRecordingSids.add(sid);
+  try {
+    let fields = {};
+    try { fields = (await base('CALL LOG').find(logId)).fields || {}; } catch (e) { console.error('call recording email: could not read CALL LOG:', e.message); }
+    const pick = (v) => (v && typeof v === 'object' ? v.name : v) || '';
+    const attachments = await fetchRecordingAttachment(recordingUrl, 'call-recording.mp3'); // alerts + returns null on failure
+    const tooBig = attachments && Buffer.byteLength(attachments[0].content, 'base64') > CALL_RECORDING_EMAIL_MAX_BYTES;
+    const attach = attachments && !tooBig ? attachments : undefined;
+    const mins = Number.isFinite(durationSecs) ? `${Math.floor(durationSecs / 60)}:${String(durationSecs % 60).padStart(2, '0')}` : '';
+    const row = (k, v) => (v ? `<tr><td style="padding:3px 14px 3px 0;color:#555;">${k}</td><td><b>${String(v).replace(/</g, '&lt;')}</b></td></tr>` : '');
+    const ts = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+    await sendEmail({
+      to: process.env.CALL_RECORDING_EMAIL_TO || 'snapflatfee2@gmail.com',
+      subject: 'IVR - Completed Call Recording',
+      html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
+        <h2 style="color:#003087;">🎙️ Completed call recording</h2>
+        <table style="font-size:14px;">
+          ${row('Property', fields.Real_Address || fields.Property_Address)}
+          ${row('Caller', [fields.Caller_Number, pick(fields.Caller_Type)].filter(Boolean).join(' · '))}
+          ${row('Language', pick(fields.Language))}
+          ${row('Recorded length', mins)}
+          ${row('Email sent', ts + ' ET')}
+        </table>
+        <p>${attach ? 'The full recording (caller + seller, both sides) is attached as <b>call-recording.mp3</b>.'
+          : (tooBig ? 'The recording is too large to attach — listen to it in Airtable (CALL LOG → MP3).' : 'The recording could not be attached — listen to it in Airtable (CALL LOG → MP3). An error alert was sent.')}</p>
+        <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p></div>`,
+      attachments: attach,
+    });
+  } catch (err) {
+    emailedRecordingSids.delete(sid);   // let a later delivery of the same recording try again
+    await alertError('emailing the completed call recording', err);
+  }
+}
+
+async function saveCallRecording(logId, recordingUrl, via, durationSecs) {
   if (!logId || !recordingUrl) return;
   const sid = recordingSidOf(recordingUrl);
   if (savedRecordingSids.has(sid)) return;
   savedRecordingSids.add(sid);
   console.log(`call recording ${sid} → CALL LOG ${logId} (${via})`);
   await base('CALL LOG').update(logId, { Second_Leg_Recording_URL: recordingUrl }).catch((e) => console.error('Second_Leg_Recording_URL update failed:', e.message));
-  const ok = await saveRecordingToAirtable(logId, recordingUrl, AT_FIELDS.callMp3, 'call-recording.mp3');
-  if (!ok) savedRecordingSids.delete(sid); // let the next look-up retry
+  // Email and Airtable are independent: a failure in one never blocks the other.
+  const [, ok] = await Promise.all([
+    emailCompletedCallRecording(logId, recordingUrl, durationSecs),
+    saveRecordingToAirtable(logId, recordingUrl, AT_FIELDS.callMp3, 'call-recording.mp3'),
+  ]);
+  if (!ok) savedRecordingSids.delete(sid); // let the next look-up retry the Airtable save
 }
 
 // Safety net: no call has ever had its recording saved by Twilio's callback (it may never fire), so
@@ -256,7 +301,7 @@ async function backfillCallRecordings(logId, callSids) {
       const url = r.mediaUrl
         ? r.mediaUrl.replace(/\.(mp3|wav)$/i, '')
         : `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${r.sid}`;
-      await saveCallRecording(logId, url, 'look-up');
+      await saveCallRecording(logId, url, 'look-up', parseInt(r.duration, 10));
     }
   }
 }
@@ -1274,7 +1319,7 @@ app.post('/second-leg-recording', async (req, res) => {
   res.sendStatus(200); // ack Twilio immediately; the save below can take a moment
   // Full call recording (not a 120s-capped voicemail): saved into the CALL LOG "MP3" field via a
   // short-lived link, so there is no file-size limit. Not emailed.
-  await saveCallRecording(logId, recordingUrl, 'webhook');
+  await saveCallRecording(logId, recordingUrl, 'webhook', parseInt(req.body.RecordingDuration, 10));
 });
 
 // ─── SELLER STATUS ────────────────────────────────────────────────────────────
