@@ -4,6 +4,7 @@
  * v2.0 — Dual voice, language selection, FL two-party consent
  */
 
+const crypto    = require('crypto');
 const express   = require('express');
 const twilio    = require('twilio');
 const Airtable  = require('airtable');
@@ -90,7 +91,7 @@ const claude        = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // Sign up free at resend.com, get API key, add RESEND_API_KEY to Railway env vars
 // Sends FROM noreply@snapflatfee.com, replies go to snapflatfee@gmail.com
 async function sendEmail({ to, subject, html, attachments }) {
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = await fetch(`${process.env.RESEND_API_URL || 'https://api.resend.com'}/emails`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
@@ -154,31 +155,126 @@ async function fetchRecordingAttachment(recordingUrl, filename = 'voicemail.mp3'
   }
 }
 
-// ─── Recording into Airtable's own attachment field ──────────────────────────
-// Airtable's uploadAttachment endpoint (content.airtable.com — a separate
-// domain from the regular API, not wrapped by the old `airtable` npm client)
-// takes base64 file content directly, so it works even though the source
-// Twilio URL is auth-gated — unlike a normal {url}-style attachment, Airtable
-// never has to fetch anything itself. Field is matched by NAME ("Voicemail
-// File"); if that field is ever renamed in Airtable, update this to match.
-async function uploadRecordingToAirtable(recordId, base64, filename = 'voicemail.mp3', fieldName = 'Voicemail File') {
+// ─── Recordings into Airtable ────────────────────────────────────────────────
+// Attachment fields are addressed by their permanent Airtable ID, never by name. (On 2026-11-09 the
+// voicemail upload failed with a 403 "model not found" because the code said "Voicemail File" and the
+// field is called "Voicemail_File". Renaming a field in Airtable can no longer break this.)
+const AT_FIELDS = {
+  voicemail: { id: 'fldMMqmGHjQAR3Db4', name: 'Voicemail_File' }, // voicemail left on our line (<= 120s)
+  callMp3:   { id: 'fldhLW65JGGv27bId', name: 'MP3' },            // full call with the seller
+};
+const AIRTABLE_CONTENT_URL = process.env.AIRTABLE_CONTENT_URL || 'https://content.airtable.com';
+const DIRECT_UPLOAD_MAX_BYTES = 4.5 * 1024 * 1024; // Airtable's direct upload limit is 5 MB
+
+// Way 1 (small files): push the bytes straight into the field. Airtable's endpoint takes base64, so the
+// auth-gated Twilio URL doesn't matter. Returns true/false; the caller decides what to do on failure.
+async function uploadRecordingToAirtable(recordId, base64, filename, field = AT_FIELDS.voicemail) {
   if (!recordId || !base64) return false;
   try {
-    const url = `https://content.airtable.com/v0/${process.env.AIRTABLE_BASE_ID}/${recordId}/${encodeURIComponent(fieldName)}/uploadAttachment`;
+    if (Buffer.byteLength(base64, 'base64') > DIRECT_UPLOAD_MAX_BYTES) throw new Error('file is over the 5 MB direct-upload limit');
+    const url = `${AIRTABLE_CONTENT_URL}/v0/${process.env.AIRTABLE_BASE_ID}/${recordId}/${field.id}/uploadAttachment`;
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.AIRTABLE_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Authorization': `Bearer ${process.env.AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ contentType: 'audio/mpeg', file: base64, filename }),
     });
     if (!res.ok) throw new Error(`Airtable uploadAttachment ${res.status}: ${(await res.text()).slice(0, 300)}`);
     return true;
   } catch (err) {
-    await alertError('uploadRecordingToAirtable', err);
+    console.error(`direct upload to ${field.name} failed (${err.message}) — will try the link method`);
     return false;
   }
+}
+
+// Way 2 (any size): give Airtable a short-lived, unguessable link to the recording and let Airtable
+// download its own copy. Our server streams the audio from Twilio (with our Twilio login) so Airtable
+// never needs one. The link works for 15 minutes, then it is gone.
+const recordingLinks = new Map(); // token -> { url (Twilio recording URL, no extension), expires }
+function createRecordingLink(twilioRecordingUrl) {
+  const token = crypto.randomBytes(24).toString('hex');
+  recordingLinks.set(token, { url: twilioRecordingUrl.replace(/\.(mp3|wav|json)$/i, ''), expires: Date.now() + 15 * 60 * 1000 });
+  setTimeout(() => recordingLinks.delete(token), 15 * 60 * 1000).unref();
+  return `${(process.env.BASE_URL || '').replace(/\/+$/, '')}/rec/${token}.mp3`;
+}
+app.get('/rec/:token.mp3', async (req, res) => {
+  const entry = recordingLinks.get(req.params.token);
+  if (!entry || entry.expires < Date.now()) return res.status(404).send('Not found');
+  try {
+    const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+    const upstream = await fetch(`${entry.url}.mp3`, { headers: { Authorization: `Basic ${auth}` } });
+    if (!upstream.ok) return res.status(502).send('Recording not available yet');
+    res.set({ 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
+    const len = upstream.headers.get('content-length');
+    if (len) res.set('Content-Length', len);
+    require('stream').Readable.fromWeb(upstream.body).pipe(res);
+  } catch (err) {
+    console.error('recording link error:', err.message);
+    if (!res.headersSent) res.status(502).send('Error');
+  }
+});
+
+// Save a recording into an attachment field: direct upload when we already have the (small) bytes,
+// otherwise — or if that fails — the link method. One alert email if both fail.
+async function saveRecordingToAirtable(recordId, recordingUrl, field, filename, base64) {
+  if (base64 && await uploadRecordingToAirtable(recordId, base64, filename, field)) return true;
+  try {
+    const value = [{ url: createRecordingLink(recordingUrl), filename }];
+    try { await base('CALL LOG').update(recordId, { [field.id]: value }); }
+    catch (byIdErr) { await base('CALL LOG').update(recordId, { [field.name]: value }); }
+    return true;
+  } catch (err) {
+    await alertError(`saving recording to Airtable (${field.name})`, err);
+    return false;
+  }
+}
+
+// The recording of the call with the seller. Twilio's callback AND our own look-up (below) can both
+// deliver the same recording, so each one is only saved once.
+const savedRecordingSids = new Set();
+const recordingSidOf = (url) => (/\/Recordings\/(RE[0-9a-f]{32})/i.exec(url || '') || [])[1] || url;
+async function saveCallRecording(logId, recordingUrl, via) {
+  if (!logId || !recordingUrl) return;
+  const sid = recordingSidOf(recordingUrl);
+  if (savedRecordingSids.has(sid)) return;
+  savedRecordingSids.add(sid);
+  console.log(`call recording ${sid} → CALL LOG ${logId} (${via})`);
+  await base('CALL LOG').update(logId, { Second_Leg_Recording_URL: recordingUrl }).catch((e) => console.error('Second_Leg_Recording_URL update failed:', e.message));
+  const ok = await saveRecordingToAirtable(logId, recordingUrl, AT_FIELDS.callMp3, 'call-recording.mp3');
+  if (!ok) savedRecordingSids.delete(sid); // let the next look-up retry
+}
+
+// Safety net: no call has ever had its recording saved by Twilio's callback (it may never fire), so
+// after the seller's leg ends we also ask Twilio directly for the call's recordings, twice
+// (20s and 90s later — a recording can take a moment to finish processing).
+const BACKFILL_DELAYS = (process.env.RECORDING_BACKFILL_DELAYS_MS || '20000,90000').split(',').map(Number).filter(Boolean);
+async function backfillCallRecordings(logId, callSids) {
+  for (const callSid of callSids) {
+    const recs = await twilioClient.recordings.list({ callSid, limit: 10 });
+    console.log(`recording look-up: call ${callSid} has ${recs.length} recording(s)`);
+    for (const r of recs) {
+      if (r.status !== 'completed' || (r.source && r.source !== 'DialVerb')) continue; // skip voicemails etc.
+      const url = r.mediaUrl
+        ? r.mediaUrl.replace(/\.(mp3|wav)$/i, '')
+        : `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${r.sid}`;
+      await saveCallRecording(logId, url, 'look-up');
+    }
+  }
+}
+function scheduleRecordingBackfill(logId, callSids) {
+  const sids = [...new Set((callSids || []).filter(Boolean))];
+  if (!logId || !sids.length) return;
+  BACKFILL_DELAYS.forEach((ms) => setTimeout(
+    () => backfillCallRecordings(logId, sids).catch((e) => console.error('recording look-up failed:', e.message)), ms).unref());
+}
+
+// Append a line to a CALL LOG record's Notes (without wiping what's there).
+async function appendNote(logId, text) {
+  if (!logId) return;
+  try {
+    const rec = await base('CALL LOG').find(logId);
+    const cur = rec.get('Notes') || '';
+    await base('CALL LOG').update(logId, { Notes: cur ? `${cur}\n${text}` : text });
+  } catch (e) { console.error('appendNote failed:', e.message); }
 }
 
 const VOICE = {
@@ -189,6 +285,14 @@ const VOICE = {
 function say(twiml, lang, text) {
   twiml.say(VOICE[lang], text);
 }
+
+// Every prompt that asks a caller to leave a message must ask for the property address.
+const MSG_EN = 'Please leave your name, your callback number, the property address, and your message after the tone.';
+const MSG_ES = 'Por favor deje su nombre, su numero de telefono, la direccion de la propiedad y su mensaje despues del tono.';
+const leaveMsg = (lang) => (lang === 'es' ? MSG_ES : MSG_EN);
+const notFoundPrompt = (lang) => (lang === 'es'
+  ? `Lo sentimos, no pudimos encontrar esa propiedad. Tomaremos su mensaje. ${MSG_ES} Un representante de servicio procesara su consulta a la brevedad.`
+  : `I'm sorry, we couldn't find that property. We'll take your message. ${MSG_EN} A service representative will process your inquiry shortly.`);
 
 // ─── Business Hours Check (7:00 AM – 9:00 PM Eastern, every day) ────────────
 function isWithinBusinessHours() {
@@ -297,13 +401,12 @@ function playTransferPrompt(twiml, lang, isRental, logId, matchId, callerNumber)
 // ─── FCHB SPECIAL CASE ───────────────────────────────────────────────────────
 const FCHB_EMAILS = ['kevin@floridacashhomebuyers.com', 'alejandro@floridacashhomebuyers.com'];
 async function handleFCHB(res, twiml, { match, lang, logId }) {
-  await base('CALL LOG').update(logId, {
-    Call_Disposition: 'FCHB - Voicemail',
-    Notes: 'FCHB property — routed directly to voicemail per account rule.',
-  }).catch(console.error);
+  // (Call_Disposition has no "FCHB" option in Airtable — writing one is rejected — so use Voicemail Left + a note.)
+  if (logId) await base('CALL LOG').update(logId, { Call_Disposition: 'Voicemail Left' }).catch(console.error);
+  appendNote(logId, 'FCHB property — routed directly to voicemail per account rule.');
   say(twiml, lang, lang === 'es'
-    ? 'Gracias. Por favor deje su mensaje detallado despues del tono y se lo haremos llegar al propietario.'
-    : 'Thank you. Please leave a detailed message after the tone and we will forward it to the property owner right away.'
+    ? `Gracias. ${MSG_ES} Se lo haremos llegar al propietario de inmediato.`
+    : `Thank you. ${MSG_EN} We will forward it to the property owner right away.`
   );
   twiml.record({
     maxLength: 120, transcribe: true,
@@ -342,7 +445,14 @@ app.post('/call-status', async (req, res) => {
       const records = await base('CALL LOG').select({
         filterByFormula: `{Call_ID}=${airtableStr(callSid)}`, maxRecords: 1,
       }).firstPage();
-      if (records.length) setImmediate(() => postCallSends(records[0].id));
+      if (records.length) {
+        const id = records[0].id;
+        const secs = parseInt(req.body.CallDuration, 10);
+        if (callStatus === 'completed' && Number.isFinite(secs)) {
+          base('CALL LOG').update(id, { Call_Duration_Sec: secs }).catch((e) => console.error('Call_Duration_Sec update failed:', e.message));
+        }
+        setImmediate(() => postCallSends(id));
+      }
     } catch (err) { console.error('call-status error:', err.message); }
   }
   res.sendStatus(200);
@@ -399,9 +509,9 @@ app.post('/afterhours-lang', (req, res) => {
 
   say(twiml, lang, lang === 'es'
     ? 'Desafortunadamente estamos fuera de nuestro horario de atencion de 7 AM a 9 PM todos los dias. ' +
-      'Por favor deje un mensaje con su nombre, su numero de telefono y la direccion de la propiedad despues del tono y le contactaremos prontamente.'
+      `${MSG_ES} Le contactaremos prontamente.`
     : 'Unfortunately you reached us outside our working schedule, which is from 7 AM to 9 PM every day. ' +
-      'Please leave a message with your name, callback number and the property address after the tone and we will get back to you shortly.'
+      `${MSG_EN} We will get back to you shortly.`
   );
   twiml.record({
     maxLength: 120, transcribe: true,
@@ -462,8 +572,8 @@ app.post('/caller-type', (req, res) => {
   const isOther = digits === '3' || /\b(other|otro|otra|something else|3)\b/.test(speech);
   if (isOther) {
     say(twiml, lang, lang === 'es'
-      ? 'Por favor deje un mensaje detallado despues del tono y le contactaremos prontamente.'
-      : 'Please leave a detailed message after the tone and we will get back to you promptly.'
+      ? `${leaveMsg('es')} Le contactaremos prontamente.`
+      : `${leaveMsg('en')} We will get back to you promptly.`
     );
     twiml.record({
       maxLength: 120, transcribe: true,
@@ -478,12 +588,15 @@ app.post('/caller-type', (req, res) => {
   const isTenant   = /\b(tenant|inquilino|rent|alquil)\b/i.test(speech);
   const callerType = isRealtor ? 'Realtor' : (isTenant ? 'Tenant' : 'Buyer');
 
-  // Address request — force en-US STT even for Spanish callers
-  // because all Airtable addresses are in English format
+  // Address request — recognized in the CALLER's language (Spanish callers: es-US). The recognized text is
+  // normalized (suroeste → SW, avenida → Ave …) before matching against the English addresses in Airtable,
+  // and if the address still can't be pinned down we fall back to the keypad (see findBestMatch).
   const gather = twiml.gather({
     input: 'speech dtmf', numDigits: 1, timeout: 10, speechTimeout: 'auto',
-    language: 'en-US',   // ← ALWAYS en-US for address recognition
-    hints: 'street, avenue, boulevard, drive, court, lane, circle, road, way, place, terrace, trail, NW, NE, SW, SE, north, south, east, west, two, other, 2',
+    language: VOICE[lang].language,
+    hints: lang === 'es'
+      ? 'calle, avenida, bulevar, camino, norte, sur, este, oeste, noroeste, suroeste, noreste, sureste, otra, dos, 2'
+      : 'street, avenue, boulevard, drive, court, lane, circle, road, way, place, terrace, trail, NW, NE, SW, SE, north, south, east, west, two, other, 2',
     action: `${process.env.BASE_URL}/lookup-property?lang=${lang}&type=${callerType}&callSid=${callSid}`,
     method: 'POST',
   });
@@ -506,27 +619,150 @@ app.post('/caller-type', (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // STEP 4 — AIRTABLE LOOKUP
 // ═══════════════════════════════════════════════════════════════════════════════
-// Fetch + shape all listings. Started as soon as the caller finishes speaking
-// so the Airtable round-trip overlaps the "one moment" prompt / hold music.
-const listingsCache = new Map(); // callSid -> Promise<listings[]>
+// ─── Address matching ────────────────────────────────────────────────────────
+// Speech-to-text is imperfect (and gets worse for Spanish callers), so a "close enough" fuzzy match is
+// NOT trusted on its own: the house number the caller said must equal the listing's house number, the
+// direction (NW/SW…) must agree, and any other street numbers (13th, 8th…) must be present. If we can't
+// pin the address down, we ask for the house number on the keypad and read candidates back to the caller.
+// (2026-11-09: "On to Southwest." was fuzzy-matched to an unrelated Temp Off listing and the caller was
+// told it was "no longer available".)
+const DIRECTIONS = { north: 'n', south: 's', east: 'e', west: 'w', northwest: 'nw', northeast: 'ne', southwest: 'sw', southeast: 'se',
+                     norte: 'n', sur: 's', este: 'e', oeste: 'w', noroeste: 'nw', noreste: 'ne', suroeste: 'sw', sureste: 'se' };
+const SUFFIXES = { avenue: 'ave', avenida: 'ave', av: 'ave', street: 'st', calle: 'st', drive: 'dr', boulevard: 'blvd', bulevar: 'blvd',
+                   court: 'ct', corte: 'ct', lane: 'ln', road: 'rd', camino: 'rd', terrace: 'ter', terraza: 'ter', circle: 'cir',
+                   circulo: 'cir', place: 'pl', trail: 'trl', highway: 'hwy', parkway: 'pkwy' };
+const DROP_WORDS = new Set(['apt', 'apartment', 'apartamento', 'apto', 'unit', 'unidad', 'suite', 'ste', 'number', 'numero']);
+const DIR_TOKENS = new Set(['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']);
+
+function normalizeAddress(s) {
+  let t = String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  t = t.replace(/[.,#]/g, ' ').replace(/\s+/g, ' ');
+  t = t.replace(/\b(south|sur)\s*(west|oeste)\b/g, 'sw').replace(/\b(south|sur)\s*(east|este)\b/g, 'se')
+       .replace(/\b(north|nor|norte)\s*(west|oeste)\b/g, 'nw').replace(/\b(north|nor|norte)\s*(east|este)\b/g, 'ne');
+  t = t.replace(/\b(\d+)(st|nd|rd|th)\b/g, '$1');
+  return t.split(' ').map((w) => DIRECTIONS[w] || SUFFIXES[w] || w).filter((w) => w && !DROP_WORDS.has(w)).join(' ').trim();
+}
+function houseNumbers(addr) {            // "1008-1010 Habershan Ave" -> ['1008','1010']
+  const m = /^\s*(\d+)(?:\s*-\s*(\d+))?/.exec(String(addr || ''));
+  return m ? [m[1], m[2]].filter(Boolean) : [];
+}
+const isLive = (l) => /^(active|pending)$/i.test(String(l.status || '').trim());
+
+function findBestMatch(listings, spoken) {
+  const q = normalizeAddress(spoken);
+  const qTokens = q.split(' ');
+  const wantNum = qTokens.find((w) => /^\d{1,6}$/.test(w));
+  if (!wantNum) return null;                                  // no house number heard → keypad
+  const qDirs = qTokens.filter((w) => DIR_TOKENS.has(w));
+  const qOtherNums = qTokens.filter((w) => /^\d+$/.test(w) && w !== wantNum);
+  const pool = listings.filter((l) => {
+    if (!l.nums.includes(wantNum)) return false;
+    const lTokens = l.norm.split(' ');
+    const lDirs = lTokens.filter((w) => DIR_TOKENS.has(w));
+    if (qDirs.length && lDirs.length && qDirs.join(' ') !== lDirs.join(' ')) return false;   // SW ≠ NW
+    return qOtherNums.every((n) => lTokens.includes(n));                                     // 13th must be there
+  });
+  if (!pool.length) return null;
+  // Compare only "house number + the next few words": filler before ("yes it's …") or after ("…please") is noise.
+  const core = qTokens.slice(qTokens.indexOf(wantNum), qTokens.indexOf(wantNum) + 8).join(' ');
+  const results = new Fuse(pool, { keys: ['norm', 'normFull'], threshold: 0.45, includeScore: true, ignoreLocation: true }).search(core);
+  if (!results.length) return null;
+  const best = results[0].score;
+  const near = results.filter((r) => r.score <= best + 0.05).map((r) => r.item);   // same property listed more than once
+  return near.find(isLive) || near[0];
+}
+
+// For free-form messages (after-hours voicemail transcripts): try each number in the text as a possible
+// house number, using the words after it as the street. Same strict checks as findBestMatch.
+function findMatchInText(listings, text) {
+  const words = normalizeAddress(text).split(' ');
+  for (let i = 0; i < words.length; i++) {
+    if (!/^\d{1,6}$/.test(words[i])) continue;
+    const m = findBestMatch(listings, words.slice(i, i + 7).join(' '));
+    if (m) return m;
+  }
+  return null;
+}
+
+// ─── Fetch + shape all listings ─────────────────────────────────────────────
+// Started as soon as the caller finishes speaking so the Airtable round-trip overlaps the
+// "one moment" prompt / hold music.
+const listingsCache = new Map(); // callSid -> { done, promise }
 function fetchListings() {
   return base('ALL LISTINGS').select({
     fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email',
              'BAC Offered','Commission NOTES','Type','List Price','Notes','UniqueID','Status','SMS_Recording_Consent'],
-  }).all().then(records => records.map(r => ({
-    id: r.id, prop_id: r.get('UniqueID') || '',
-    address:     r.get('Address') || r.get('Street Address') || '',
-    city:        r.get('City') || '',
-    fullAddress: [r.get('Address') || r.get('Street Address'), r.get('City'), r.get('State'), r.get('Zip code')].filter(Boolean).join(', '),
-    name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
-    bac: r.get('BAC Offered') || '', commNotes: r.get('Commission NOTES') || '',
-    type: r.get('Type') || '', price: r.get('List Price') || '', notes: r.get('Notes') || '',
-    status: (r.get('Status') || '').toString(),
-  })));
+  }).all().then(records => records.map(r => {
+    const address     = r.get('Address') || r.get('Street Address') || '';
+    const fullAddress = [address, r.get('City'), r.get('State'), r.get('Zip code')].filter(Boolean).join(', ');
+    return {
+      id: r.id, prop_id: r.get('UniqueID') || '',
+      address, city: r.get('City') || '', fullAddress,
+      name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
+      bac: r.get('BAC Offered') || '', commNotes: r.get('Commission NOTES') || '',
+      type: r.get('Type') || '', price: r.get('List Price') || '', notes: r.get('Notes') || '',
+      status: (r.get('Status') || '').toString(),
+      norm: normalizeAddress(address), normFull: normalizeAddress(fullAddress), nums: houseNumbers(address),
+    };
+  }));
+}
+async function getListings(callSid) {
+  const pending = listingsCache.get(callSid)?.promise || fetchListings();
+  // Cap the wait at 8s → falls to /universal-fallback rather than a Twilio timeout drop
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('listings lookup timed out')), 8000).unref());
+  return Promise.race([pending, timeout]);
 }
 
-// Front door: acknowledge, start the lookup in the background, play hold audio,
-// then redirect to /lookup-property-run which does the matching.
+// ─── Shared call-log + voicemail endings for the lookup ─────────────────────
+const lookupQS = (o) => new URLSearchParams(o).toString();
+async function createLookupLog({ callSid, callerNumber, callerType, lang, spoken, extraNotes, fields }) {
+  try {
+    const rec = await base('CALL LOG').create({
+      Name: `Call ${new Date().toISOString()}`, Call_ID: callSid,
+      Call_Date: new Date().toISOString(), Caller_Number: callerNumber,
+      Caller_Type: callerType, Language: lang === 'es' ? 'Spanish' : 'English',
+      Property_Address: spoken,
+      Notes: `Caller consented to recording by continuing on the line (FL two-party notice at greeting).${extraNotes ? ` ${extraNotes}` : ''}`,
+      ...fields,
+    });
+    return rec.id;
+  } catch (logErr) {
+    console.error('CALL LOG create (non-fatal):', logErr.message || logErr);   // never blocks the call
+    return '';
+  }
+}
+
+// "We couldn't find that property" — used when there is no match, the match is not Active/Pending,
+// or the caller rejected every keypad candidate. Always asks for the property address.
+async function finishNotFound(res, { lang, callerType, callSid, callerNumber, spoken, reason }) {
+  const logId = await createLookupLog({
+    callSid, callerNumber, callerType, lang, spoken: spoken || '(not recognized)', extraNotes: reason,
+    fields: { Call_Disposition: 'No Match Found' },
+  });
+  const twiml = new VoiceResponse();
+  say(twiml, lang, notFoundPrompt(lang));
+  twiml.record({
+    maxLength: 120, transcribe: true,
+    transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=true`,
+    action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
+  });
+  return res.type('text/xml').send(twiml.toString());
+}
+
+// A confirmed, Active/Pending property: log it and continue into the Realtor / Buyer flow.
+async function startWithMatch(res, { match, spoken, lang, callerType, callSid, callerNumber, via }) {
+  const twiml = new VoiceResponse();
+  const fields = {
+    Real_Address: match.fullAddress, Prop_ID: match.prop_id,
+    BAC_Disclosed: callerType === 'Realtor' ? match.bac : '',
+    Listing_Link: [match.id],  // Airtable JS client expects string IDs, not objects
+  };
+  const logId = await createLookupLog({ callSid, callerNumber, callerType, lang, spoken, extraNotes: via, fields });
+  if (callerType === 'Realtor') return realtorFlow(res, twiml, { match, lang, callerNumber, callSid, logId });
+  return buyerTenantFlow(res, twiml, { match, lang, callerNumber, callerType, callSid, logId });
+}
+
+// ─── Front door: acknowledge, start the lookup in the background, play hold audio ──
 app.post('/lookup-property', (req, res) => {
   const speech  = (req.body.SpeechResult || '').toLowerCase().trim();
   const digits  = (req.body.Digits || '').trim();
@@ -535,16 +771,15 @@ app.post('/lookup-property', (req, res) => {
   const callerType = req.query.type || 'Buyer';
   const callSid = req.query.callSid || req.body.CallSid;
 
-  // "Something else" / no address → skip the hold, existing logic handles it
+  // "Something else" / nothing heard → skip the hold, handleLookup decides
   if (!spoken || digits === '2' || /\b(something else|other|otro|otra|2)\b/.test(speech)) {
     return handleLookup(req, res);
   }
 
   const entry = { done: false, promise: fetchListings() };
-  // mark done either way; the awaiting handler reports any error
   entry.promise.then(() => { entry.done = true; }, () => { entry.done = true; });
   listingsCache.set(callSid, entry);
-  setTimeout(() => listingsCache.delete(callSid), 5 * 60 * 1000).unref();
+  setTimeout(() => listingsCache.delete(callSid), 10 * 60 * 1000).unref();
 
   const twiml = new VoiceResponse();
   say(twiml, lang, lang === 'es'
@@ -559,8 +794,7 @@ app.post('/lookup-property-run', (req, res) => {
   const callSid = req.query.callSid || req.body.CallSid;
   const attempt = parseInt(req.query.attempt || '0', 10);
   const entry   = listingsCache.get(callSid);
-  // Search still running after the first hold → hold again (max 2 extra rounds)
-  // instead of leaving dead air
+  // Search still running after the first hold → hold again (max 2 extra rounds) instead of dead air
   if (entry && !entry.done && attempt < 2) {
     const twiml = new VoiceResponse();
     if (process.env.HOLD_MUSIC_URL) twiml.play(process.env.HOLD_MUSIC_URL);
@@ -577,7 +811,7 @@ app.post('/lookup-property-run', (req, res) => {
 async function handleLookup(req, res) {
   const speech        = (req.body.SpeechResult || '').toLowerCase().trim();
   const digits        = (req.body.Digits || '').trim();
-  const spokenAddress = req.body.SpeechResult || '';
+  const spokenAddress = (req.body.SpeechResult || '').trim();
   const lang          = req.query.lang || 'en';
   const callerType    = req.query.type || 'Buyer';
   const callSid       = req.query.callSid || req.body.CallSid;
@@ -588,8 +822,8 @@ async function handleLookup(req, res) {
   const isSomethingElse = digits === '2' || /\b(something else|other|otro|otra|2)\b/.test(speech);
   if (isSomethingElse) {
     say(twiml, lang, lang === 'es'
-      ? 'Por favor deje un mensaje detallado despues del tono y le contactaremos prontamente.'
-      : 'Please leave a detailed message after the tone and we will get back to you promptly.'
+      ? `${leaveMsg('es')} Le contactaremos prontamente.`
+      : `${leaveMsg('en')} We will get back to you promptly.`
     );
     twiml.record({
       maxLength: 120, transcribe: true,
@@ -599,92 +833,140 @@ async function handleLookup(req, res) {
     return res.type('text/xml').send(twiml.toString());
   }
 
-  // No address spoken — route through /voicemail so CALL LOG is always created
-  // This also handles Spanish callers whose en-US STT returns empty
-  if (!spokenAddress.trim()) {
-    twiml.redirect(`${process.env.BASE_URL}/voicemail?lang=${lang}&reason=no_address&type=${callerType}&callSid=${callSid}&attention=true`);
+  // Nothing recognized (common when speech-to-text fails) → ask for the house number on the keypad
+  if (!spokenAddress) {
+    twiml.redirect(`${process.env.BASE_URL}/lookup-keypad?${lookupQS({ lang, type: callerType, callSid, spoken: '' })}`);
     return res.type('text/xml').send(twiml.toString());
   }
 
-  let logId = '';
-
   try {
-    // Cap the wait at 8s → falls to /universal-fallback rather than a Twilio timeout drop
-    const pending  = listingsCache.get(callSid)?.promise || fetchListings();
-    const timeout  = new Promise((_, rej) => setTimeout(() => rej(new Error('listings lookup timed out')), 8000).unref());
-    const listings = await Promise.race([pending, timeout]);
-    listingsCache.delete(callSid);
+    const listings = await getListings(callSid);
+    const match    = findBestMatch(listings, spokenAddress);
 
-    const fuse    = new Fuse(listings, { keys: ['address','fullAddress','city'], threshold: 0.45, includeScore: true });
-    const results = fuse.search(spokenAddress.trim());
-    const match   = results.length > 0 ? results[0].item : null;
-
-    // ── CREATE CALL LOG (isolated — failure never blocks call flow) ───────────
-    try {
-      const logFields = {
-        Name: `Call ${new Date().toISOString()}`, Call_ID: callSid,
-        Call_Date: new Date().toISOString(), Caller_Number: callerNumber,
-        Caller_Type: callerType, Language: lang === 'es' ? 'Spanish' : 'English',
-        Property_Address: spokenAddress.trim(),
-        Notes: 'Caller consented to recording by continuing on the line (FL two-party notice at greeting).',
-      };
-      if (match) {
-        logFields.Real_Address  = match.fullAddress;
-        logFields.Prop_ID       = match.prop_id;
-        logFields.BAC_Disclosed = callerType === 'Realtor' ? match.bac : '';
-        logFields.Listing_Link  = [match.id];  // Airtable JS client expects string IDs, not objects
-      } else {
-        logFields.Call_Disposition = 'No Match Found';
-      }
-      const logRecord = await base('CALL LOG').create(logFields);
-      logId = logRecord.id;
-    } catch (logErr) {
-      console.error('CALL LOG create (non-fatal):', logErr.message || logErr);
-    }
-
-    if (!match) {
-      say(twiml, lang, lang === 'es'
-        ? 'Lo sentimos, no encontramos esa propiedad en nuestro sistema. Por favor deje un mensaje y le contactaremos a la brevedad.'
-        : 'I\'m sorry, I couldn\'t find that property in our system. Please leave a message and someone will follow up with you shortly.'
-      );
-      twiml.record({
-        maxLength: 120, transcribe: true,
-        transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=true`,
-        action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
-      });
+    if (!match) {   // couldn't pin the address down → keypad
+      twiml.redirect(`${process.env.BASE_URL}/lookup-keypad?${lookupQS({ lang, type: callerType, callSid, spoken: spokenAddress })}`);
       return res.type('text/xml').send(twiml.toString());
     }
-
-    // Status filter
-    const statusOk = /^active$|^pending$/i.test(match.status.trim());
-    if (!statusOk) {
-      if (logId) await base('CALL LOG').update(logId, { Call_Disposition: 'Inactive Property', Notes: `Status: "${match.status}"` }).catch(console.error);
-      say(twiml, lang, lang === 'es'
-        ? 'Desafortunadamente esta propiedad ya no se encuentra disponible. Si desea dejar un mensaje, puede hacerlo despues del tono.'
-        : 'Unfortunately this property is no longer available. You may leave a message after the tone if you would like.'
-      );
-      twiml.record({
-        maxLength: 120, transcribe: true,
-        transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=true`,
-        action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
-      });
-      return res.type('text/xml').send(twiml.toString());
+    if (!isLive(match)) {   // anything other than Active/Pending: don't say "no longer available", just "couldn't find it"
+      return finishNotFound(res, { lang, callerType, callSid, callerNumber, spoken: spokenAddress,
+        reason: `Matched ${match.fullAddress} but its Status is "${match.status || 'blank'}" — caller was told we couldn't find the property.` });
     }
-
-    // Route by caller type
-    if (callerType === 'Realtor') {
-      return realtorFlow(res, twiml, { match, lang, callerNumber, callSid, logId });
-    } else {
-      return buyerTenantFlow(res, twiml, { match, lang, callerNumber, callerType, callSid, logId });
-    }
-
+    return startWithMatch(res, { match, spoken: spokenAddress, lang, callerType, callSid, callerNumber });
   } catch (err) {
     console.error('Lookup error — message:', err.message, '| statusCode:', err.statusCode);
     console.error('Env check — API_KEY set:', !!process.env.AIRTABLE_API_KEY, '| BASE_ID:', process.env.AIRTABLE_BASE_ID);
-    twiml.redirect(`${process.env.BASE_URL}/universal-fallback?lang=${lang}&logId=${logId}&callSid=${callSid}`);
+    twiml.redirect(`${process.env.BASE_URL}/universal-fallback?lang=${lang}&logId=&callSid=${callSid}`);
     res.type('text/xml').send(twiml.toString());
   }
 }
+
+// ─── Keypad fallback: house number → read candidates back → yes (1) / no (2) ───────────────────────
+app.post('/lookup-keypad', (req, res) => {
+  const lang = req.query.lang || 'en';
+  const qs   = lookupQS({ lang, type: req.query.type || 'Buyer', callSid: req.query.callSid || req.body.CallSid, spoken: req.query.spoken || '' });
+  const twiml  = new VoiceResponse();
+  const gather = twiml.gather({
+    input: 'dtmf', finishOnKey: '#', timeout: 10,
+    action: `${process.env.BASE_URL}/lookup-number?${qs}`, method: 'POST',
+  });
+  gather.say(VOICE[lang], lang === 'es'
+    ? 'No pude encontrar esa direccion. Por favor use el teclado para marcar la parte numerica de la direccion, el numero de la casa, y luego oprima la tecla de numeral.'
+    : 'I couldn\'t find that address. Please use your keypad to enter the numeric portion of the address, the house number, and then press pound.'
+  );
+  twiml.redirect(`${process.env.BASE_URL}/lookup-number?${qs}`);   // nothing keyed
+  res.type('text/xml').send(twiml.toString());
+});
+
+const keypadCandidates = (listings, digits) => listings
+  .filter((l) => isLive(l) && l.nums.includes(digits))
+  .sort((a, b) => (/^active$/i.test(b.status) - /^active$/i.test(a.status)) || a.address.localeCompare(b.address))
+  .slice(0, 4);
+const spokenListing = (l) => {
+  const addr = speakableAddress(l.address);
+  return l.city && !addr.toLowerCase().includes(l.city.toLowerCase()) ? `${addr}, ${l.city}` : addr;
+};
+
+app.post('/lookup-number', async (req, res) => {
+  const lang = req.query.lang || 'en';
+  const callerType = req.query.type || 'Buyer';
+  const callSid = req.query.callSid || req.body.CallSid;
+  const callerNumber = req.body.From || '';
+  const spoken = req.query.spoken || '';
+  const digits = (req.body.Digits || '').replace(/\D/g, '');
+  const twiml  = new VoiceResponse();
+  const ctx = { lang, callerType, callSid, callerNumber, spoken };
+  try {
+    if (!digits) return finishNotFound(res, { ...ctx, reason: 'Address not recognized and no house number was keyed.' });
+    const cands = keypadCandidates(await getListings(callSid), digits);
+    if (!cands.length) return finishNotFound(res, { ...ctx, spoken: spoken || `(keypad) ${digits}`, reason: `Caller keyed house number ${digits}; no Active/Pending listing has that number.` });
+    twiml.redirect(`${process.env.BASE_URL}/lookup-confirm?${lookupQS({ lang, type: callerType, callSid, spoken, digits, idx: '0' })}`);
+    return res.type('text/xml').send(twiml.toString());
+  } catch (err) {
+    console.error('lookup-number error:', err.message);
+    twiml.redirect(`${process.env.BASE_URL}/universal-fallback?lang=${lang}&logId=&callSid=${callSid}`);
+    return res.type('text/xml').send(twiml.toString());
+  }
+});
+
+app.post('/lookup-confirm', async (req, res) => {
+  const lang = req.query.lang || 'en';
+  const callerType = req.query.type || 'Buyer';
+  const callSid = req.query.callSid || req.body.CallSid;
+  const spoken = req.query.spoken || '';
+  const digits = req.query.digits || '';
+  const idx    = parseInt(req.query.idx || '0', 10);
+  const twiml  = new VoiceResponse();
+  try {
+    const cands = keypadCandidates(await getListings(callSid), digits);
+    if (idx >= cands.length) {
+      return finishNotFound(res, { lang, callerType, callSid, callerNumber: req.body.From || '', spoken: spoken || `(keypad) ${digits}`,
+        reason: `Caller keyed house number ${digits}; none of the ${cands.length} suggested properties was confirmed.` });
+    }
+    const qs = lookupQS({ lang, type: callerType, callSid, spoken, digits, idx: String(idx) });
+    const gather = twiml.gather({
+      input: 'speech dtmf', numDigits: 1, timeout: 8, speechTimeout: 'auto', language: VOICE[lang].language,
+      hints: lang === 'es' ? 'si, no, uno, dos, 1, 2' : 'yes, no, one, two, 1, 2',
+      action: `${process.env.BASE_URL}/lookup-confirm-answer?${qs}`, method: 'POST',
+    });
+    gather.say(VOICE[lang], lang === 'es'
+      ? `Es esta la propiedad: ${spokenListing(cands[idx])}? Oprima 1 para si, o 2 para no.`
+      : `Is this the property: ${spokenListing(cands[idx])}? Press 1 for yes, or press 2 for no.`
+    );
+    twiml.redirect(`${process.env.BASE_URL}/lookup-confirm-answer?${qs}&silent=1`);   // no answer = no
+    return res.type('text/xml').send(twiml.toString());
+  } catch (err) {
+    console.error('lookup-confirm error:', err.message);
+    twiml.redirect(`${process.env.BASE_URL}/universal-fallback?lang=${lang}&logId=&callSid=${callSid}`);
+    return res.type('text/xml').send(twiml.toString());
+  }
+});
+
+app.post('/lookup-confirm-answer', async (req, res) => {
+  const lang = req.query.lang || 'en';
+  const callerType = req.query.type || 'Buyer';
+  const callSid = req.query.callSid || req.body.CallSid;
+  const spoken = req.query.spoken || '';
+  const digits = req.query.digits || '';
+  const idx    = parseInt(req.query.idx || '0', 10);
+  const speech = (req.body.SpeechResult || '').toLowerCase();
+  const key    = (req.body.Digits || '').trim();
+  const twiml  = new VoiceResponse();
+  const yes = key === '1' || /\b(yes|yeah|yep|si|sí|uno|one)\b/.test(speech);
+  const no  = key === '2' || /\b(no|nope|dos|two)\b/.test(speech) || req.query.silent === '1';
+  const next = (n) => { twiml.redirect(`${process.env.BASE_URL}/lookup-confirm?${lookupQS({ lang, type: callerType, callSid, spoken, digits, idx: String(n) })}`); return res.type('text/xml').send(twiml.toString()); };
+  try {
+    if (!yes && !no) return next(idx);       // some other key → ask again
+    if (no) return next(idx + 1);            // next candidate, or "couldn't find it" when out of candidates
+    const match = keypadCandidates(await getListings(callSid), digits)[idx];
+    if (!match) return next(idx);
+    return startWithMatch(res, { match, spoken: spoken || `(keypad) ${digits}`, lang, callerType, callSid, callerNumber: req.body.From || '',
+      via: `Address confirmed by caller on the keypad (house number ${digits}).` });
+  } catch (err) {
+    console.error('lookup-confirm-answer error:', err.message);
+    twiml.redirect(`${process.env.BASE_URL}/universal-fallback?lang=${lang}&logId=&callSid=${callSid}`);
+    return res.type('text/xml').send(twiml.toString());
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STEP 4A — REALTOR FLOW
@@ -695,6 +977,7 @@ function speakableAddress(a) {
   const sfx  = { ave: 'Avenue', st: 'Street', dr: 'Drive', blvd: 'Boulevard', ct: 'Court', ln: 'Lane',
                  rd: 'Road', ter: 'Terrace', cir: 'Circle', pl: 'Place' };
   return (a || '')
+    .replace(/,?\s*\b\d{5}(-\d{4})?\s*$/, '')   // a ZIP code read aloud is "thirty-three thousand…"
     .replace(/\b(nw|ne|sw|se)\b\.?/gi, m => dirs[m.replace('.', '').toLowerCase()])
     .replace(/\b(ave|st|dr|blvd|ct|ln|rd|ter|cir|pl)\b\.?$/i, m => sfx[m.replace('.', '').toLowerCase()]);
 }
@@ -797,10 +1080,10 @@ app.post('/realtor-question', async (req, res) => {
     // the context (Sherman Act evidence layer, see README). Recorded + routed to
     // snapflatfee2 ONLY, never the seller (see branch=commission below).
     const messagePromptEN =
-      'Please leave a detailed message after the tone. We value feedback from all our cooperating agents, ' +
+      'Please leave a detailed message after the tone, including the property address. We value feedback from all our cooperating agents, ' +
       'including any comments about our commission policy, and will make sure it reaches the broker directly.';
     const messagePromptES =
-      'Por favor deje un mensaje detallado despues del tono. Valoramos los comentarios de todos nuestros agentes cooperantes, ' +
+      'Por favor deje un mensaje detallado despues del tono, incluyendo la direccion de la propiedad. Valoramos los comentarios de todos nuestros agentes cooperantes, ' +
       'incluyendo cualquier comentario sobre nuestra politica de comisiones, y nos aseguraremos de que llegue directamente al corredor.';
 
     await base('CALL LOG').update(logId, { Transcript: `Realtor asked about commission. Response played.` }).catch(console.error);
@@ -855,8 +1138,8 @@ app.post('/realtor-commission-choice', (req, res) => {
     // Explicit "message" choice, or anything else recognized as speech/digits that
     // wasn't "showing" → voicemail → snapflatfee2 ONLY (not seller — may contain complaints)
     say(twiml, lang, lang === 'es'
-      ? 'Por favor deje un mensaje detallado despues del tono. Valoramos los comentarios de todos nuestros agentes cooperantes, incluyendo cualquier comentario sobre nuestra politica de comisiones, y nos aseguraremos de que llegue directamente al corredor.'
-      : 'Please leave a detailed message after the tone. We value feedback from all our cooperating agents, including any comments about our commission policy, and will make sure it reaches the broker directly.'
+      ? 'Por favor deje un mensaje detallado despues del tono, incluyendo la direccion de la propiedad. Valoramos los comentarios de todos nuestros agentes cooperantes, incluyendo cualquier comentario sobre nuestra politica de comisiones, y nos aseguraremos de que llegue directamente al corredor.'
+      : 'Please leave a detailed message after the tone, including the property address. We value feedback from all our cooperating agents, including any comments about our commission policy, and will make sure it reaches the broker directly.'
     );
     twiml.record({
       maxLength: 120, transcribe: true,
@@ -923,7 +1206,6 @@ app.post('/transfer-seller', async (req, res) => {
   const lang    = req.query.lang || 'en';
   const matchId = decodeURIComponent(req.query.matchId || '');
   const logId   = req.query.logId;
-  const callerType = req.query.type || 'Buyer';
   const twiml   = new VoiceResponse();
 
   try {
@@ -939,19 +1221,29 @@ app.post('/transfer-seller', async (req, res) => {
       const partyEN = isRental ? 'the landlord' : 'the seller';
       const partyES = isRental ? 'el propietario' : 'el vendedor';
       say(twiml, lang, lang === 'es'
-        ? `Le transferimos con ${partyES}. Un momento por favor.`
-        : `We are connecting you with ${partyEN} now. One moment please.`
+        ? `Le transferimos con ${partyES}. Si ${partyES} no contesta, puede dejar un mensaje en su buzon de voz despues del tono. Por favor mencione la direccion de la propiedad en su mensaje. Un momento por favor.`
+        : `We are connecting you with ${partyEN} now. If ${partyEN} doesn't answer, you can leave a message on their voicemail after the tone. Please mention the property address in your message. One moment please.`
       );
 
+      // Plain forward — no whisper/screening. If the seller's own voicemail picks up, the caller is
+      // connected to it and leaves the message there (the call is recorded either way).
+      // timeout: how long we let the seller's phone ring before giving up. It must be longer than the
+      // seller's carrier takes to send a call to voicemail (usually 20-30s) or the caller never reaches it.
+      // callerId: by default the seller's phone shows the ORIGINAL CALLER's number (Twilio's default for <Dial>),
+      // so the seller can call back from the missed-call/voicemail entry. Set SELLER_CALLER_ID=twilio in
+      // Railway to show SnapFlatFee's number instead.
+      const ringSeconds = Math.min(120, Math.max(15, parseInt(process.env.SELLER_RING_SECONDS, 10) || 40));
+      const showTwilioId = (process.env.SELLER_CALLER_ID || 'caller').toLowerCase() === 'twilio';
       const dial = twiml.dial({
         record: 'record-from-answer-dual-channel',
         recordingStatusCallback: `${process.env.BASE_URL}/second-leg-recording?logId=${logId}`,
         recordingStatusCallbackMethod: 'POST',
         action: `${process.env.BASE_URL}/seller-unavailable?lang=${lang}&logId=${logId}&sellerEmail=${encodeURIComponent(sellerEmail)}`,
         method: 'POST',
+        timeout: ringSeconds,
+        ...(showTwilioId && process.env.TWILIO_PHONE_NUMBER ? { callerId: process.env.TWILIO_PHONE_NUMBER } : {}),
       });
       dial.number({
-        url: `${process.env.BASE_URL}/seller-whisper?isRental=${isRental}&callerType=${encodeURIComponent(callerType)}`,
         statusCallback: `${process.env.BASE_URL}/seller-status?logId=${logId}`,
         statusCallbackMethod: 'POST',
         statusCallbackEvent: 'answered completed',
@@ -968,59 +1260,18 @@ app.post('/transfer-seller', async (req, res) => {
   res.type('text/xml').send(twiml.toString());
 });
 
-// ─── SELLER WHISPER — always English ─────────────────────────────────────────
-app.post('/seller-whisper', (req, res) => {
-  const isRental   = req.query.isRental === 'true';
-  const callerType = req.query.callerType || 'Buyer';
-  const who = callerType === 'Realtor' ? 'a Realtor'
-    : (callerType === 'Tenant' || isRental) ? 'a potential tenant'
-    : 'a potential buyer';
-  const twiml    = new VoiceResponse();
-  const gather   = twiml.gather({
-    input: 'speech dtmf', numDigits: 1, timeout: 8, speechTimeout: 'auto',
-    language: 'en-US', hints: 'yes, no, accept, ok, one, two, 1, 2',
-    action: `${process.env.BASE_URL}/seller-consent`, method: 'POST',
-  });
-  gather.say(VOICE.en,
-    `Hi, this is SnapFlatFee calling. We have ${who} on the line inquiring about your property. ` +
-    `Press 1 or say yes to connect. Or press 2 or say no, and we'll take a message and send it to you by email. ` +
-    `This call will be recorded.`
-  );
-  say(twiml, 'en', 'No response received. We will take a message and email it to you.');
-  twiml.hangup();
-  res.type('text/xml').send(twiml.toString());
-});
-
-// ─── SELLER CONSENT ───────────────────────────────────────────────────────────
-app.post('/seller-consent', (req, res) => {
-  const speech   = (req.body.SpeechResult || '').toLowerCase();
-  const digits   = (req.body.Digits || '').trim();
-  const declined = digits === '2' || /\b(no|nope|two)\b/.test(speech);
-  const accepted = !declined && (digits === '1' || /yes|ok|si|sí|aceptar|accept|one/.test(speech));
-  const twiml    = new VoiceResponse();
-  if (accepted) {
-    res.type('text/xml').send('<Response></Response>'); // connect the call
-  } else {
-    twiml.say(VOICE.en, "No problem. We'll take a message and email it to you. Goodbye.");
-    twiml.hangup();
-    res.type('text/xml').send(twiml.toString());
-  }
-});
+// (Removed: /seller-whisper and /seller-consent — the seller is no longer screened with a press-1 prompt.
+//  The call is forwarded straight to the seller's phone or their own voicemail. See /transfer-seller.)
 
 // ─── SECOND LEG RECORDING ─────────────────────────────────────────────────────
 app.post('/second-leg-recording', async (req, res) => {
   const recordingUrl = req.body.RecordingUrl || '';
   const logId        = req.query.logId || '';
-  res.sendStatus(200); // ack Twilio immediately; the fetch+upload below can take a moment
-  if (logId && recordingUrl) {
-    await base('CALL LOG').update(logId, { Second_Leg_Recording_URL: recordingUrl }).catch(console.error);
-    // Full call recording, not a 120s-capped voicemail — can be much larger,
-    // so it's pushed straight to Airtable's "Call Recording File" field, not emailed.
-    const attachment = await fetchRecordingAttachment(recordingUrl, 'call-recording.mp3');
-    if (attachment) {
-      await uploadRecordingToAirtable(logId, attachment[0].content, 'call-recording.mp3', 'Call Recording File');
-    }
-  }
+  console.log(`second-leg-recording webhook: status=${req.body.RecordingStatus || '?'} duration=${req.body.RecordingDuration || '?'}s logId=${logId || '(none)'}`);
+  res.sendStatus(200); // ack Twilio immediately; the save below can take a moment
+  // Full call recording (not a 120s-capped voicemail): saved into the CALL LOG "MP3" field via a
+  // short-lived link, so there is no file-size limit. Not emailed.
+  await saveCallRecording(logId, recordingUrl, 'webhook');
 });
 
 // ─── SELLER STATUS ────────────────────────────────────────────────────────────
@@ -1030,12 +1281,17 @@ app.post('/seller-status', async (req, res) => {
   if (logId) {
     const answered = callStatus === 'completed' || callStatus === 'answered';
     await base('CALL LOG').update(logId, { Seller_Accepted_Call: answered }).catch(console.error);
+    // The seller's leg is over: make sure its recording ends up in the "MP3" field even if Twilio's
+    // own recording callback never arrives (see backfillCallRecordings).
+    if (callStatus === 'completed') scheduleRecordingBackfill(logId, [req.body.ParentCallSid, req.body.CallSid]);
   }
   res.sendStatus(200);
 });
 
 // ─── SELLER UNAVAILABLE ───────────────────────────────────────────────────────
-// Fires when <Dial> ends. Detects real call vs voicemail via duration.
+// Fires when <Dial> ends. A call that lasted >= 20s is either a live conversation OR the caller leaving a
+// message on the seller's own voicemail (we can't tell which without screening) — either way nothing more to do.
+// Anything shorter or unanswered means nobody took the call, so we offer our own voicemail.
 app.post('/seller-unavailable', async (req, res) => {
   const lang         = req.query.lang || 'en';
   const logId        = req.query.logId || '';
@@ -1045,21 +1301,19 @@ app.post('/seller-unavailable', async (req, res) => {
   const dialDuration = parseInt(req.body.DialCallDuration || '0', 10);
   const twiml        = new VoiceResponse();
 
-  // Real completed call (≥20s) → silent hangup, recording saves async
+  // Completed call (≥20s: live talk or a message left on the seller's voicemail) → silent hangup, recording saves async
   if (dialStatus === 'completed' && dialDuration >= 20) {
-    if (logId) {
-      await base('CALL LOG').update(logId, { Call_Disposition: 'Completed' }).catch(console.error);
-      setImmediate(() => postCallSends(logId)); // fire SMS/email after response
-    }
+    // (No disposition write here: "Completed" isn't one of Airtable's Call_Disposition options, so it was always
+    //  rejected. The row already says "Transferred to Seller"; Call_Duration_Sec is filled in by /call-status.)
+    if (logId) setImmediate(() => postCallSends(logId)); // fire SMS/email after response
     return res.type('text/xml').send('<Response><Hangup/></Response>');
   }
 
-  // No-answer / busy / failed / short completed (seller VM likely) → our voicemail
+  // No-answer / busy / failed / short completed (seller hung up, or their voicemail cut off) → our own voicemail
   if (logId) {
-    await base('CALL LOG').update(logId, {
-      Call_Disposition: `Seller Unavailable (${dialStatus || 'unknown'})`,
-      Seller_Accepted_Call: false,
-    }).catch(console.error);
+    // "Seller Unavailable (…)" isn't an Airtable option either; "Transferred to Voicemail" is, and the detail goes in Notes.
+    await base('CALL LOG').update(logId, { Call_Disposition: 'Transferred to Voicemail', Seller_Accepted_Call: false }).catch(console.error);
+    appendNote(logId, `Seller leg ended: ${dialStatus || 'unknown'} after ${dialDuration}s — caller offered our voicemail.`);
     setImmediate(() => postCallSends(logId)); // caller still gets their SMS
   }
 
@@ -1144,10 +1398,10 @@ app.post('/voicemail', async (req, res) => {
   const noAddressPrompt = reason === 'no_address';
   const promptEN = noAddressPrompt
     ? `We weren't able to capture the property address. Please leave your name, callback number and the full property address after the tone and we will get back to you shortly.`
-    : `Please leave your message with your name and callback number after the tone.${context} We'll get back to you shortly.`;
+    : `${MSG_EN}${context} We'll get back to you shortly.`;
   const promptES = noAddressPrompt
     ? `No pudimos capturar la direccion de la propiedad. Por favor deje su nombre, numero de telefono y la direccion completa despues del tono y le contactaremos a la brevedad.`
-    : `Por favor deje su mensaje con su nombre y numero de telefono despues del tono.${context} Le contactaremos a la brevedad.`;
+    : `${MSG_ES}${context} Le contactaremos a la brevedad.`;
 
   say(twiml, lang, lang === 'es' ? promptES : promptEN);
   twiml.record({
@@ -1177,15 +1431,19 @@ app.post('/voicemail-transcribed', async (req, res) => {
   const isAttention  = req.query.attention === 'true';
   const isCommission = req.query.branch === 'commission'; // ← commission branch → snapflatfee2 ONLY
 
+  // Twilio's built-in voicemail transcription only understands English (documented), so a Spanish message
+  // comes out as nonsense. Say so, and point to the audio, instead of presenting the nonsense as a transcript.
+  const spanishNote = lang === 'es' ? 'Spanish message — the automatic transcript is English-only and unreliable. Listen to the recording.' : '';
   if (logId) {
     await base('CALL LOG').update(logId, {
-      Transcript: transcript, Voicemail_URL: recordingUrl, Call_Disposition: 'Voicemail Left',
+      Transcript: spanishNote ? `[${spanishNote}]\n${transcript}` : transcript,
+      Voicemail_URL: recordingUrl, Call_Disposition: 'Voicemail Left',
     }).catch(console.error);
   }
 
   const ts          = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
   const attachments = await fetchRecordingAttachment(recordingUrl);
-  if (logId && attachments) uploadRecordingToAirtable(logId, attachments[0].content);
+  if (logId && recordingUrl) saveRecordingToAirtable(logId, recordingUrl, AT_FIELDS.voicemail, 'voicemail.mp3', attachments && attachments[0].content);
   const recordingLine = attachments
     ? `<p><b>Recording:</b> attached to this email (voicemail.mp3)</p>`
     : `<p><b>Recording:</b> <a href="${recordingUrl}">Listen</a> (requires Twilio Console login — attachment failed to fetch, see Railway logs)</p>`;
@@ -1193,7 +1451,8 @@ app.post('/voicemail-transcribed', async (req, res) => {
     <h2 style="color:#003087;">📞 ${title}</h2>
     <p><b>Time:</b> ${ts}</p>${extra}
     ${recordingLine}
-    <h3>Transcript</h3>
+    ${spanishNote ? `<p style="background:#fff7e6;padding:10px 12px;border-left:4px solid #e35c21;"><b>Mensaje en español.</b> ${spanishNote}</p>` : ''}
+    <h3>${spanishNote ? 'Automatic transcript (English-only — unreliable for Spanish)' : 'Transcript'}</h3>
     <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript || 'Pending...'}</p>
     <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p></div>`;
 
@@ -1248,23 +1507,17 @@ app.post('/afterhours-transcribed', async (req, res) => {
   const recordingUrl = req.body.RecordingUrl || '';
   const callSid      = req.body.CallSid || '';
   const callerNumber = req.body.From || '';
+  const lang         = req.query.lang || 'en';
   const ts           = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  // Twilio's voicemail transcription is English-only, so a Spanish message is garbled (see /voicemail-transcribed).
+  const spanishNote  = lang === 'es' ? 'Spanish message — the automatic transcript is English-only and unreliable. Listen to the recording.' : '';
+  const noteHtml     = spanishNote ? `<p style="background:#fff7e6;padding:10px 12px;border-left:4px solid #e35c21;"><b>Mensaje en español.</b> ${spanishNote}</p>` : '';
 
   try {
-    const records = await base('ALL LISTINGS').select({
-      filterByFormula: `OR({Status}='Active',{Status}='Pending',{Status}='Coming Soon')`,
-      fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email'],
-    }).all();
-    const listings = records.map(r => ({
-      id: r.id,
-      address: r.get('Address') || r.get('Street Address') || '',
-      city: r.get('City') || '',
-      fullAddress: [r.get('Address') || r.get('Street Address'), r.get('City'), r.get('State'), r.get('Zip code')].filter(Boolean).join(', '),
-      name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
-    }));
-    const fuse    = new Fuse(listings, { keys: ['address','fullAddress','city'], threshold: 0.45 });
-    const results = fuse.search(transcript);
-    const match   = results.length > 0 ? results[0].item : null;
+    // Only trust an address match that passes the same strict checks as live calls (house number, direction…).
+    // A loose fuzzy match here could email the wrong seller about someone else's call.
+    const listings = (await fetchListings()).filter((l) => /^(active|pending|coming soon)$/i.test(String(l.status).trim()));
+    const match    = findMatchInText(listings, transcript);
     const attachments   = await fetchRecordingAttachment(recordingUrl);
     const recordingLine = attachments
       ? `<p>Recording attached to this email (voicemail.mp3)</p>`
@@ -1275,14 +1528,14 @@ app.post('/afterhours-transcribed', async (req, res) => {
       const logRecord = await base('CALL LOG').create({
         Name: `After-Hours ${new Date().toISOString()}`, Call_ID: callSid,
         Call_Date: new Date().toISOString(), Caller_Number: callerNumber,
-        Caller_Type: 'Unknown', Property_Address: transcript, Transcript: transcript,
+        Caller_Type: 'Unknown', Property_Address: transcript, Transcript: spanishNote ? `[${spanishNote}]\n${transcript}` : transcript,
         Voicemail_URL: recordingUrl, Call_Disposition: match ? 'Voicemail Left' : 'No Match Found',
         Real_Address: match ? match.fullAddress : '',
         Listing_Link: match ? [match.id] : undefined,
       });
       afterHoursLogId = logRecord.id;
     } catch (e) { console.error('After-hours log error:', e); }
-    if (afterHoursLogId && attachments) uploadRecordingToAirtable(afterHoursLogId, attachments[0].content);
+    if (afterHoursLogId && recordingUrl) saveRecordingToAirtable(afterHoursLogId, recordingUrl, AT_FIELDS.voicemail, 'voicemail.mp3', attachments && attachments[0].content);
 
     if (match && match.email) {
       await sendEmail({
@@ -1294,7 +1547,8 @@ app.post('/afterhours-transcribed', async (req, res) => {
           <p>We received an after-hours call about your property at <strong>${match.fullAddress}</strong>.</p>
           <p>Caller: <strong>${callerNumber}</strong></p>
           ${recordingLine}
-          <h3>Transcript</h3>
+          ${noteHtml}
+          <h3>${spanishNote ? 'Automatic transcript (English-only — unreliable for Spanish)' : 'Transcript'}</h3>
           <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript}</p>
           <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p>
         </div>`,
@@ -1308,6 +1562,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
           <h2 style="color:#003087;">📞 After-Hours Voicemail — No Match</h2>
           <p><b>Time:</b> ${ts}</p><p><b>Caller:</b> ${callerNumber}</p>
           ${recordingLine}
+          ${noteHtml}
           <p>${transcript || '(no transcript)'}</p>
         </div>`,
         attachments,
@@ -1354,10 +1609,7 @@ app.post('/universal-fallback', (req, res) => {
       'Can we also reach you by text? Press 1 for yes or press 2 for no.'
     );
   }
-  say(twiml, lang, lang === 'es'
-    ? 'Por favor deje su mensaje despues del tono.'
-    : 'Please leave your message after the tone.'
-  );
+  say(twiml, lang, leaveMsg(lang));
   twiml.record({
     maxLength: 120, transcribe: true,
     transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=true`,
@@ -1375,10 +1627,7 @@ app.post('/fallback-sms-choice', async (req, res) => {
   if ((digits === '1' || /\b(yes|si|one|uno|1)\b/.test(speech)) && logId) {
     await base('CALL LOG').update(logId, { Caller_SMS_Requested: true }).catch(console.error);
   }
-  say(twiml, lang, lang === 'es'
-    ? 'Por favor deje su mensaje con su nombre y la direccion de la propiedad despues del tono.'
-    : 'Please leave your message with your name and the property address after the tone.'
-  );
+  say(twiml, lang, leaveMsg(lang));
   twiml.record({
     maxLength: 120, transcribe: true,
     transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=true`,

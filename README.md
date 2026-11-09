@@ -77,9 +77,11 @@ Voice (IVR) flow — see `CLAUDE.md` for the full call-flow diagram:
 | POST /inbound | Answers call, plays greeting, checks business hours |
 | POST /select-language | Language selection |
 | POST /caller-type | Detects Realtor vs Buyer/Tenant |
-| POST /lookup-property | Airtable fuzzy address match |
+| POST /lookup-property, /lookup-property-run | Strict address match against Airtable (house number + direction must agree) |
+| POST /lookup-keypad, /lookup-number, /lookup-confirm, /lookup-confirm-answer | Keypad fallback: caller keys the house number, we read candidates back (1 = yes, 2 = no) |
+| GET /rec/:token.mp3 | Short-lived private link Airtable uses to download a call recording |
 | POST /realtor-branch, /realtor-question, /realtor-commission-choice | Realtor flow + commission disclosure |
-| POST /transfer-seller, /seller-whisper, /seller-status, /seller-unavailable | Connects caller to seller |
+| POST /transfer-seller, /seller-status, /seller-unavailable | Forwards the caller straight to the seller's phone (or their own voicemail) |
 | POST /voicemail, /voicemail-done, /voicemail-transcribed | Voicemail recording + transcription |
 | POST /afterhours-lang, /afterhours-transcribed | After-hours flow |
 | POST /call-status | Twilio call-status webhook (backup trigger for post-call notifications) |
