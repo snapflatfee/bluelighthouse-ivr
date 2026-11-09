@@ -1235,7 +1235,10 @@ app.post('/transfer-seller', async (req, res) => {
       const ringSeconds = Math.min(120, Math.max(15, parseInt(process.env.SELLER_RING_SECONDS, 10) || 40));
       const showTwilioId = (process.env.SELLER_CALLER_ID || 'caller').toLowerCase() === 'twilio';
       const dial = twiml.dial({
-        record: 'record-from-answer-dual-channel',
+        // MUST be one of Twilio's valid values: record-from-answer | record-from-ringing | record-from-answer-dual |
+        // record-from-ringing-dual. The old value 'record-from-answer-dual-channel' is not valid; Twilio silently
+        // ignored it, so seller calls were NEVER recorded until this was fixed on 2026-11-09.
+        record: 'record-from-answer-dual',
         recordingStatusCallback: `${process.env.BASE_URL}/second-leg-recording?logId=${logId}`,
         recordingStatusCallbackMethod: 'POST',
         action: `${process.env.BASE_URL}/seller-unavailable?lang=${lang}&logId=${logId}&sellerEmail=${encodeURIComponent(sellerEmail)}`,
