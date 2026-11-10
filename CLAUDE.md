@@ -63,6 +63,8 @@ bluelighthouse-ivr/
 | `SELLER_RING_SECONDS` *(optional)* | How long the seller's phone rings before we give up (default `40`). Keep it above the seller's carrier voicemail delay |
 | `SELLER_CALLER_ID` *(optional)* | `caller` (default: seller sees the original caller's number) or `twilio` (seller sees `TWILIO_PHONE_NUMBER`) |
 | `RECORDING_BACKFILL_DELAYS_MS` *(optional)* | Comma-separated delays for the recording look-up after the seller's leg ends (default `20000,90000`) |
+| `CALLER_SMS` *(optional)* | `off` stops the courtesy text to callers (default on) |
+| `HANGUP_FOLLOWUP_DELAY_MS` *(optional)* | Wait before texting/logging a caller who hung up before any log row existed (default 90000) |
 | `CALL_RECORDING_EMAIL_TO` *(optional)* | Where "IVR - Completed Call Recording" emails go (default `snapflatfee2@gmail.com`) |
 | `HOLD_MUSIC_URL` *(optional)* | Public URL of a short (~3–5s) MP3 played after "One moment while I look that up" while the Airtable lookup runs. Unset = spoken line only |
 | `ALERT_EMAIL` *(optional)* | Where `alertError()` sends a "something failed" email (currently: `fetchRecordingAttachment` / `uploadRecordingToAirtable` failures). Falls back to `EMAIL_TO` if unset; if neither is set, failures only show in Railway logs |
@@ -125,9 +127,9 @@ Key fields written by the IVR:
 
 The CALL LOG table also has `Seller_SMS_Sent copy`, `SMS_Confirmed`, and `SMS_Confirmed copy` fields — none of these are referenced anywhere in server.js. Likely leftover from an earlier iteration; don't assume they're kept current.
 - `Call_Disposition` — outcome string
-- `SMS_Sent`, `Seller_SMS_Sent`, `Caller_SMS_Requested`, `Seller_Accepted_Call`
+- `SMS_Sent` (caller courtesy text went out), `Seller_SMS_Sent`, `Seller_Accepted_Call`. (`Caller_SMS_Requested` is no longer written — the opt-in prompt was removed 2026-11-10.)
 - `Voicemail_URL`, `Second_Leg_Recording_URL`, `Transcript`
-- `BAC_Disclosed`, `Notes`
+- `BAC_Disclosed` — now only ever the fixed text "No offer - policy message played", written when a Realtor asks about commission and the policy script plays. The listing's `BAC Offered` field is no longer read by the IVR at all (Jorge 2026-11-10: we never offer compensation; steering tracking). `Notes` also records what the Realtor chose right after the policy message (showing vs message).
 
 ---
 
@@ -143,13 +145,13 @@ The CALL LOG table also has `Seller_SMS_Sent copy`, `SMS_Confirmed`, and `SMS_Co
                     ├── Inactive → "no longer available" → optional voicemail
                     ├── FCHB email? → /handleFCHB → voicemail → seller directly
                     ├── Realtor → /realtorFlow → /realtor-branch
-                    │     ├── Press 1 (showing) → playTransferPrompt → /flag-sms → transfer
+                    │     ├── Press 1 (showing) → playTransferPrompt ("we'll also text you") → transfer
                     │     └── Press 2 (other) → /realtor-question
                     │           ├── Commission keywords → commission script → /realtor-commission-choice
                     │           │     ├── Press 1 → transfer
                     │           │     └── Timeout → voicemail → snapflatfee2 ONLY (not seller)
                     │           └── Anything else → playTransferPrompt → transfer
-                    └── Buyer/Tenant → /buyerTenantFlow → /flag-sms → transfer
+                    └── Buyer/Tenant → /buyerTenantFlow ("we'll also text you") → transfer
                           └── Transfer → /transfer-seller
                                 ("If the seller doesn't answer, you can leave a message on their voicemail after the tone")
                                 └── plain <Dial> to the seller's phone — NO whisper/screening, dual-channel recorded,
@@ -164,9 +166,9 @@ The CALL LOG table also has `Seller_SMS_Sent copy`, `SMS_Confirmed`, and `SMS_Co
 
 ## Key Functions
 
-### `postCallSends(logId)`
+### `postCallSends(logId, { callerOnly })`
 Called when a call ends. Reads CALL LOG, finds the listing (via `Listing_Link` or `Prop_ID` fallback), then fires:
-- SMS to caller (if `Caller_SMS_Requested = true`)
+- SMS to the caller — **always** (since 2026-11-10; see "Caller text" below). Also sent when there is no listing (no address / no match).
 - SMS to seller (if `SMS_Recording_Consent = YES` in ALL LISTINGS)
 - Email to seller (always, via Resend)
 
@@ -175,7 +177,7 @@ Triggered by:
 - `/call-status` Twilio webhook (backup, fires when call ends)
 
 ### `playTransferPrompt(twiml, lang, isRental, logId, matchId, callerNumber)`
-Shared prompt for ALL Realtor transfer paths. Offers SMS opt-in, then always transfers regardless.
+Shared prompt for ALL Realtor transfer paths. Tells the caller we'll text the seller's contact info, then transfers (no press-1 opt-in since 2026-11-10).
 
 ### `notifySeller({ record, callerNumber, callerName, callerType, address, city })`
 Sends seller email (always) and SMS (if `SMS_Recording_Consent = YES`). Returns `true` if SMS sent. `callerName` is optional; when present it is shown as "(Name)" after the caller's number.
@@ -244,8 +246,18 @@ The old whisper ("Hi, this is SnapFlatFee calling… press 1 to connect") and it
 - **Known limitation:** with no screening we cannot tell a live conversation from a voicemail. Both are a ≥20s completed call → `Call_Disposition = Completed`, and `Seller_Accepted_Call` is checked whenever the seller's line *answered* (person **or** voicemail). Listen to `MP3` to know which. (Twilio's machine detection exists for `<Number>` but its docs don't say how it interacts with bridging, it may cost extra and need an account feature — deliberately not used; revisit if labeling matters.)
 - Tested by running the real server against stand-ins for Airtable (which rejects invalid dropdown values like the real one), Twilio recordings and Resend, with signed requests (50 checks on 2026-11-09, mutation-checked against the original bugs); the harness lives outside the repo.
 
-### SMS wording
-Caller SMS: "Hi. The info you requested for Property: {address, city state zip}. Contact Seller|Landlord for showings and questions at Phone… Email… Attn: Jorge Zea - Broker - Realtor." then a blank line and the opt-out. (Buyers also get the sell-with-SnapFlatFee line.) Seller SMS: "Lead alert from SnapFlatFee.com. Call received inquiring about your property…", blank line before "Attn:". **No ® anywhere in SMS** (it forces Unicode encoding); emails still carry it.
+### Caller text — every caller, always (changed 2026-11-10)
+Jorge's decision: no more "press 1 / say text" consent prompt; **everyone who calls gets a courtesy SMS** after the call (`sendCallerSms` / `callerSmsBody`, called from `postCallSends`). The prompts now just say "We will also text you the seller's contact information in case we can't connect you now" (transfer paths) or "We will also send you a text" (universal fallback).
+- Matched property **and** the call was handed to the seller (`Seller_Notified` true): "Thanks for calling the Office of Jorge Zea (Broker). Ref: {address}. In case you couldn't connect with the Seller|Landlord: Phone: … Email: …. We are available to answer any questions, just text us back." + STOP line.
+- Matched property, never reached the seller (commission voicemail, FCHB, hung up in a menu): same but **no seller contact info**.
+- No property / no address / no match: "Hi, it appears you just called the Office of Jorge Zea (Broker) but we couldn't connect or get the property address. Feel free to text us back and tell us how we can assist you."
+- Spanish callers get Spanish; if the language is unknown (hung up early) the generic text is English + Spanish. All text is plain ASCII (no accents/dashes) to stay in GSM-7 segments. The old sell-with-SnapFlatFee line for buyers was dropped (promotional text without opt-in is riskier).
+- **Hung up before any CALL LOG row existed:** `/call-status` finds no row → `scheduleHangupFollowUp` waits `HANGUP_FOLLOWUP_DELAY_MS` (default 90 s, so an after-hours voicemail's row can appear), looks again, and if still none creates a `Call_Disposition = Hung Up` row and sends the generic text. These follow-ups skip the seller notification (`callerOnly`).
+- Guards: one text per number per property per 30 minutes; blocked/anonymous numbers skipped; failed sends (e.g. landlines) are logged and ignored.
+- **Kill switch:** set `CALLER_SMS=off` in Railway (restarts the service, stops all caller texts, nothing else changes).
+- Compliance note raised with Jorge: the Twilio A2P campaign (C19Z367) was registered with the in-call opt-in; the texts are replies to a call the person placed, but Jorge should make sure the campaign's consent/opt-in description still matches, and watch for carrier filtering.
+- `/flag-sms` and `/fallback-sms-choice` are kept only so a call already mid-flow during the deploy doesn't 404.
+- Seller "Lead Call Received" emails/SMS are unchanged.
 
 Seller "Lead Call Received" email + SMS intentionally fire for every matched call that ends (including commission voicemails, inactive listings, hang-ups) — decided to keep.
 

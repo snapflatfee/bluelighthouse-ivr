@@ -11,7 +11,7 @@
 - Fuzzy-matches spoken address against Airtable `ALL LISTINGS`
 - For Realtors: discloses commission policy with a scripted response, transfers non-commission questions to the seller directly, offers to transfer to the seller for showings (the Anthropic SDK is installed but not currently wired into this flow — see `CLAUDE.md`)
 - For Buyers/Tenants: offers to connect with the seller and texts contact info
-- Sends SMS with seller contact info to the caller (with consent) and notifies the seller by SMS/email
+- Texts every caller after the call (thanks + property reference + seller contact info when connected; a "couldn't connect" text if no address or hang-up) and notifies the seller by SMS/email
 - Records calls (dual-channel) and transcribes voicemails
 - Emails voicemail transcripts and call notifications to the office
 - Logs every call to the Airtable `CALL LOG` table
@@ -107,7 +107,7 @@ SMS:
 ### CALL LOG (written per call)
 - Call_ID, Call_Date, Caller_Number, Caller_Name (only when Twilio's Caller Name Lookup is on and the carrier gives a real name), Caller_Type, Language
 - Property_Address (spoken), Real_Address, Prop_ID, Listing_Link
-- Call_Disposition, SMS_Sent, Seller_SMS_Sent, Seller_Notified, Caller_SMS_Requested, Seller_Accepted_Call
+- Call_Disposition, SMS_Sent, Seller_SMS_Sent, Seller_Notified, Seller_Accepted_Call (Caller_SMS_Requested is no longer used: every caller is texted)
 - Voicemail_URL, Second_Leg_Recording_URL, Transcript
 - BAC_Disclosed, Notes (also used to log inbound SMS replies)
 

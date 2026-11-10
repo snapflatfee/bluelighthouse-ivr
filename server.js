@@ -376,7 +376,64 @@ function isWithinBusinessHours() {
 // Reads CALL LOG record and fires pending SMS/email AFTER the call ends.
 // Called from seller-unavailable (completed) and via /call-status callback.
 const postCallSentLogIds = new Set();
-async function postCallSends(logId) {
+
+// ─── CALLER TEXT (every caller gets one — changed 2026-11-10) ─────────────────
+// No more "press 1 to get a text": after every call the caller gets a courtesy SMS.
+//   • matched a property + was connected/offered the seller → thanks + Ref + seller contact info
+//   • matched a property, never reached the seller           → thanks + Ref + "text us back"
+//   • no property / no address / hung up                      → "it looks like you called but we couldn't connect"
+// Plain ASCII on purpose (no accents, dashes or symbols) so each text stays in cheap GSM-7 segments.
+// CALLER_SMS=off in Railway is the kill switch (stops every caller text without a deploy).
+const CALLER_SMS_REPEAT_MS = 30 * 60 * 1000;   // same number + same property: one text per 30 minutes
+const recentCallerSms = new Map();
+const callerSmsOn = () => (process.env.CALLER_SMS || 'on').toLowerCase() !== 'off';
+
+function callerSmsBody({ lang, listing, fullAddr, transferred }) {
+  const EN_TAIL = '\n\nMsg & data rates may apply. Reply STOP to opt out.';
+  const ES_TAIL = '\n\nTarifas pueden aplicar. Responda STOP para cancelar.';
+  if (!listing) {
+    const en = `Hi, it appears you just called the Office of Jorge Zea (Broker) but we couldn't connect or get the property address. Feel free to text us back and tell us how we can assist you.`;
+    const es = `Hola, parece que llamo a la oficina de Jorge Zea (Corredor) pero no pudimos comunicarnos ni obtener la direccion de la propiedad. Envienos un texto y digenos como podemos ayudarle.`;
+    return lang === 'es' ? es + ES_TAIL : lang === 'en' ? en + EN_TAIL : `${en}\n\n${es}${ES_TAIL}`;
+  }
+  const isRental = /rent|lease|alquil/i.test((listing.get('Type') || '').toString());
+  const phone = (listing.get('Phone') || '').toString().trim();
+  const email = (listing.get('Email') || '').toString().trim();
+  const contactEN = [phone && `Phone: ${phone}`, email && `Email: ${email}`].filter(Boolean).join('. ');
+  const partyEN = isRental ? 'Landlord' : 'Seller';
+  const partyES = isRental ? 'el propietario' : 'el vendedor';
+  if (lang === 'es') {
+    return `Gracias por llamar a la oficina de Jorge Zea (Corredor). Ref: ${fullAddr}.` +
+      (transferred && contactEN ? ` Por si no logro comunicarse con ${partyES}: ${contactEN}.` : '') +
+      ` Estamos a su disposicion para cualquier pregunta, solo responda a este texto.${ES_TAIL}`;
+  }
+  return `Thanks for calling the Office of Jorge Zea (Broker). Ref: ${fullAddr}.` +
+    (transferred && contactEN ? ` In case you couldn't connect with the ${partyEN}: ${contactEN}.` : '') +
+    ` We are available to answer any questions, just text us back.${EN_TAIL}`;
+}
+
+async function sendCallerSms({ to, lang, listing, fullAddr, transferred }) {
+  if (!callerSmsOn()) return false;
+  if (!/^\+\d{10,15}$/.test(String(to || ''))) return false;            // blocked / anonymous callers
+  if (to === process.env.TWILIO_PHONE_NUMBER) return false;
+  const key = `${to}|${listing ? listing.id : 'none'}`;
+  const last = recentCallerSms.get(key);
+  if (last && Date.now() - last < CALLER_SMS_REPEAT_MS) { console.log(`Caller SMS skipped (already texted ${to} in the last 30 min)`); return false; }
+  recentCallerSms.set(key, Date.now());
+  if (recentCallerSms.size > 1000) recentCallerSms.delete(recentCallerSms.keys().next().value);
+  try {
+    await twilioClient.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to, body: callerSmsBody({ lang, listing, fullAddr, transferred }) });
+    return true;
+  } catch (e) {
+    console.error('Caller SMS error:', e.message);
+    recentCallerSms.delete(key);   // let a later attempt retry
+    return false;
+  }
+}
+
+// postCallSends(logId, { callerOnly }) — callerOnly skips the seller notification (used for the delayed
+// hang-up / after-hours follow-up, where the seller was already handled by another path).
+async function postCallSends(logId, { callerOnly = false } = {}) {
   if (!logId) return;
   // /seller-unavailable AND /call-status both trigger this — send once per call
   if (postCallSentLogIds.has(logId)) return;
@@ -384,11 +441,11 @@ async function postCallSends(logId) {
   setTimeout(() => postCallSentLogIds.delete(logId), 2 * 60 * 60 * 1000).unref();
   try {
     const logRecord          = await base('CALL LOG').find(logId);
-    const callerSMSRequested = logRecord.get('Caller_SMS_Requested') || false;
     const callerNumber       = logRecord.get('Caller_Number') || '';
     const callerName         = logRecord.get('Caller_Name')   || '';
     const callerType         = logRecord.get('Caller_Type')   || 'Buyer';
-    const lang               = logRecord.get('Language') === 'Spanish' ? 'es' : 'en';
+    const langField          = logRecord.get('Language');
+    const lang               = langField === 'Spanish' ? 'es' : langField === 'English' ? 'en' : 'both';
     // Try Listing_Link first — Airtable sometimes silently drops linked record
     // writes on create, so fall back to Prop_ID search if link is empty
     let listing = null;
@@ -398,50 +455,41 @@ async function postCallSends(logId) {
     }
     if (!listing) {
       const propId = (logRecord.get('Prop_ID') || '').toString().trim();
-      if (!propId) {
-        console.log(`postCallSends: no Listing_Link or Prop_ID on logId ${logId} — nothing to send`);
-        return;
+      if (propId) {
+        const recs = await base('ALL LISTINGS').select({
+          filterByFormula: `{UniqueID}=${airtableStr(propId)}`,
+          maxRecords: 1,
+          fields: ['Address','Street Address','City','State','Zip code','Type','Phone','Email','Name','SMS_Recording_Consent'],
+        }).firstPage();
+        if (recs.length) {
+          listing = recs[0];
+          console.log(`postCallSends: Listing_Link was empty — used Prop_ID fallback (${propId})`);
+        } else {
+          console.log(`postCallSends: no listing found for prop_id ${propId}`);
+        }
+      } else {
+        console.log(`postCallSends: no Listing_Link or Prop_ID on logId ${logId} — caller gets the generic text, no seller notice`);
       }
-      const recs = await base('ALL LISTINGS').select({
-        filterByFormula: `{UniqueID}=${airtableStr(propId)}`,
-        maxRecords: 1,
-        fields: ['Address','Street Address','City','State','Zip code','Type','Phone','Email','Name','SMS_Recording_Consent'],
-      }).firstPage();
-      if (!recs.length) {
-        console.log(`postCallSends: no listing found for prop_id ${propId}`);
-        return;
-      }
-      listing = recs[0];
-      console.log(`postCallSends: Listing_Link was empty — used Prop_ID fallback (${propId})`);
     }
 
-    const address = listing.get('Address') || listing.get('Street Address') || '';
-    const city    = listing.get('City') || '';
-    const state   = listing.get('State') || '';
-    const zip     = listing.get('Zip code') || '';
+    const address = listing ? (listing.get('Address') || listing.get('Street Address') || '') : '';
+    const city    = listing ? (listing.get('City') || '') : '';
+    const state   = listing ? (listing.get('State') || '') : '';
+    const zip     = listing ? (listing.get('Zip code') || '') : '';
     const fullAddr = [address, [city, state, zip].filter(Boolean).join(' ')].filter(Boolean).join(', ');
 
-    // SMS to caller (only if they opted in during call)
-    if (callerSMSRequested && callerNumber) {
-      const isBuyer   = callerType !== 'Realtor';
-      const isRental  = /rent|lease/i.test((listing.get('Type') || '').toString());
-      const partyEN   = isRental ? 'Landlord' : 'Seller';
-      const partyES   = isRental ? 'el propietario' : 'el vendedor';
-      const buyerAdEN = isBuyer ? ' If you ever need to sell your property and save the entire commission, visit www.SnapFlatFee.com' : '';
-      const buyerAdES = isBuyer ? ' Para vender su propiedad y ahorrar la comision visitenos en www.SnapFlatFee.com' : '';
-      const msgBody   = lang === 'es'
-        ? `Hola. La informacion que solicito para la propiedad: ${fullAddr}. Contacte a ${partyES} para visitas y preguntas al Telefono: ${listing.get('Phone') || ''}. Email: ${listing.get('Email') || ''}. Attn: Jorge Zea - Broker - Realtor.${buyerAdES}\n\nTarifas pueden aplicar. Responda STOP para cancelar.`
-        : `Hi. The info you requested for Property: ${fullAddr}. Contact ${partyEN} for showings and questions at Phone: ${listing.get('Phone') || ''}. Email: ${listing.get('Email') || ''}. Attn: Jorge Zea - Broker - Realtor.${buyerAdEN}\n\nMsg & data rates may apply. Reply STOP to opt out.`;
-      await twilioClient.messages.create({
-        from: process.env.TWILIO_PHONE_NUMBER, to: callerNumber, body: msgBody,
-      }).catch(e => console.error('Caller SMS error:', e.message));
-      await base('CALL LOG').update(logId, { SMS_Sent: true }).catch(console.error);
+    // SMS to the caller — always (see CALLER TEXT above)
+    if (callerNumber) {
+      const sent = await sendCallerSms({ to: callerNumber, lang, listing, fullAddr, transferred: !!logRecord.get('Seller_Notified') });
+      if (sent) await base('CALL LOG').update(logId, { SMS_Sent: true }).catch(console.error);
     }
 
     // Seller notification (email always + SMS if consent)
-    const sellerSmsSent = await notifySeller({ record: listing, callerNumber, callerName, callerType, address, city });
-    if (sellerSmsSent) {
-      await base('CALL LOG').update(logId, { Seller_SMS_Sent: true }).catch(console.error);
+    if (listing && !callerOnly) {
+      const sellerSmsSent = await notifySeller({ record: listing, callerNumber, callerName, callerType, address, city });
+      if (sellerSmsSent) {
+        await base('CALL LOG').update(logId, { Seller_SMS_Sent: true }).catch(console.error);
+      }
     }
   } catch (err) {
     console.error('postCallSends error:', err.message || err);
@@ -449,23 +497,44 @@ async function postCallSends(logId) {
   }
 }
 
+// A call that ended with NO CALL LOG row (caller hung up in the greeting / language / caller-type steps).
+// Wait a moment (an after-hours voicemail's row is created when its transcript arrives), look again, and
+// if there is still no row: log it as "Hung Up" so it is visible, and send the courtesy text.
+const hangupFollowUps = new Set();
+function scheduleHangupFollowUp({ callSid, from, callerName }) {
+  if (!callSid || hangupFollowUps.has(callSid)) return;
+  hangupFollowUps.add(callSid);
+  const delay = parseInt(process.env.HANGUP_FOLLOWUP_DELAY_MS, 10) || 90000;
+  setTimeout(async () => {
+    try {
+      const found = await base('CALL LOG').select({ filterByFormula: `{Call_ID}=${airtableStr(callSid)}`, maxRecords: 1 }).firstPage();
+      let id = found.length ? found[0].id : '';
+      if (!id) {
+        const rec = await base('CALL LOG').create({
+          Name: `Call ${new Date().toISOString()}`, Call_ID: callSid, Call_Date: new Date().toISOString(),
+          Caller_Number: from || '', Caller_Type: 'Unknown', Property_Address: 'No Address',
+          Call_Disposition: 'Hung Up',
+          Notes: 'Caller hung up before reaching a property lookup or voicemail (no log row was created during the call). A courtesy text was sent.',
+          ...(callerName ? { Caller_Name: callerName } : {}),
+        });
+        id = rec.id;
+      }
+      await postCallSends(id, { callerOnly: true });
+    } catch (e) { console.error('hang-up follow-up error:', e.message || e); }
+    finally { setTimeout(() => hangupFollowUps.delete(callSid), 60 * 60 * 1000).unref(); }
+  }, delay).unref();
+}
+
 // ─── REALTOR TRANSFER PROMPT helper ──────────────────────────────────────────
 // Shared by ALL Realtor transfer paths (showing, anything-else, post-commission)
 function playTransferPrompt(twiml, lang, isRental, logId, matchId, callerNumber) {
   const partyEN = isRental ? 'landlord' : 'seller';
   const partyES = isRental ? 'el propietario' : 'el vendedor';
-  const gather  = twiml.gather({
-    input: 'speech dtmf', numDigits: 1, timeout: 5, speechTimeout: 'auto',
-    language: VOICE[lang].language,
-    hints:    lang === 'es' ? 'si, texto, uno, 1' : 'yes, text, one, 1',
-    action:   `${process.env.BASE_URL}/flag-sms?lang=${lang}&logId=${logId}&matchId=${encodeURIComponent(matchId)}&callerNumber=${encodeURIComponent(callerNumber)}&type=Realtor`,
-    method: 'POST',
-  });
-  gather.say(VOICE[lang], lang === 'es'
-    ? `${partyES.charAt(0).toUpperCase() + partyES.slice(1)} coordina las visitas y respondera sus preguntas directamente. Le transfiero ahora mismo. Oprima 1 o diga texto y le envio la informacion de contacto por si no podemos comunicarle ahora.`
-    : `The ${partyEN} handles showings and will answer any questions directly. Transferring your call right now. Press 1 or say text and I will also send you the ${partyEN}'s contact information in case we can't connect you now.`
+  // No "press 1 for a text" any more — every caller is texted after the call (see CALLER TEXT above).
+  say(twiml, lang, lang === 'es'
+    ? `${partyES.charAt(0).toUpperCase() + partyES.slice(1)} coordina las visitas y respondera sus preguntas directamente. Le transfiero ahora mismo. Tambien le enviaremos un texto con la informacion de contacto por si no podemos comunicarle ahora.`
+    : `The ${partyEN} handles showings and will answer any questions directly. Transferring your call right now. We will also text you the ${partyEN}'s contact information in case we can't connect you now.`
   );
-  // Always transfer even without SMS opt-in
   twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}&type=Realtor`);
 }
 
@@ -523,6 +592,9 @@ app.post('/call-status', async (req, res) => {
           base('CALL LOG').update(id, { Call_Duration_Sec: secs }).catch((e) => console.error('Call_Duration_Sec update failed:', e.message));
         }
         setImmediate(() => postCallSends(id));
+      } else if (callStatus === 'completed' && !/^outbound/i.test(req.body.Direction || '')) {
+        // No CALL LOG row at all: the caller hung up before a lookup/voicemail started.
+        scheduleHangupFollowUp({ callSid, from: req.body.From || '', callerName: callerNameFor(callSid) });
       }
     } catch (err) { console.error('call-status error:', err.message); }
   }
@@ -762,7 +834,7 @@ const listingsCache = new Map(); // callSid -> { done, promise }
 function fetchListings() {
   return base('ALL LISTINGS').select({
     fields: ['Address','Street Address','City','State','Zip code','Name','Phone','Email',
-             'BAC Offered','Commission NOTES','Type','List Price','Notes','UniqueID','Status','SMS_Recording_Consent'],
+             'Commission NOTES','Type','List Price','Notes','UniqueID','Status','SMS_Recording_Consent'],
   }).all().then(records => records.map(r => {
     const address     = r.get('Address') || r.get('Street Address') || '';
     const fullAddress = [address, r.get('City'), r.get('State'), r.get('Zip code')].filter(Boolean).join(', ');
@@ -770,7 +842,7 @@ function fetchListings() {
       id: r.id, prop_id: r.get('UniqueID') || '',
       address, city: r.get('City') || '', fullAddress,
       name: r.get('Name') || '', phone: r.get('Phone') || '', email: r.get('Email') || '',
-      bac: r.get('BAC Offered') || '', commNotes: r.get('Commission NOTES') || '',
+      commNotes: r.get('Commission NOTES') || '',
       type: r.get('Type') || '', price: r.get('List Price') || '', notes: r.get('Notes') || '',
       status: (r.get('Status') || '').toString(),
       norm: normalizeAddress(address), normFull: normalizeAddress(fullAddress), nums: houseNumbers(address),
@@ -826,7 +898,6 @@ async function startWithMatch(res, { match, spoken, lang, callerType, callSid, c
   const twiml = new VoiceResponse();
   const fields = {
     Real_Address: match.fullAddress, Prop_ID: match.prop_id,
-    BAC_Disclosed: callerType === 'Realtor' ? match.bac : '',
     Listing_Link: [match.id],  // Airtable JS client expects string IDs, not objects
   };
   const logId = await createLookupLog({ callSid, callerNumber, callerType, lang, spoken, extraNotes: via, fields });
@@ -1158,7 +1229,9 @@ app.post('/realtor-question', async (req, res) => {
       'Por favor deje un mensaje detallado despues del tono, incluyendo la direccion de la propiedad. Valoramos los comentarios de todos nuestros agentes cooperantes, ' +
       'incluyendo cualquier comentario sobre nuestra politica de comisiones, y nos aseguraremos de que llegue directamente al corredor.';
 
-    await base('CALL LOG').update(logId, { Transcript: `Realtor asked about commission. Response played.` }).catch(console.error);
+    // Steering evidence: we never offer compensation — the fixed policy message is played. BAC_Disclosed records that
+    // it WAS played (the listing's "BAC Offered" value is deliberately never read or spoken).
+    await base('CALL LOG').update(logId, { Transcript: `Realtor asked about commission. Response played.`, BAC_Disclosed: 'No offer - policy message played' }).catch(console.error);
 
     const gather = twiml.gather({
       input: 'speech dtmf', numDigits: 1, timeout: 6, speechTimeout: 'auto',
@@ -1203,6 +1276,8 @@ app.post('/realtor-commission-choice', (req, res) => {
   const twiml        = new VoiceResponse();
 
   const wantsShow = digits === '1' || /\b(show|showing|schedule|visita|mostrar|si\b|yes|one|uno|1)\b/i.test(speech);
+  // For steering analysis: what did the Realtor do right after hearing the compensation policy message?
+  appendNote(logId, `After the commission policy message the Realtor chose: ${wantsShow ? 'to schedule a showing' : (digits || speech) ? 'to leave a message for the broker' : 'nothing (no answer; sent to leave a message)'}.`);
 
   if (wantsShow) {
     playTransferPrompt(twiml, lang, isRental, logId, matchId, callerNumber);
@@ -1232,10 +1307,8 @@ app.post('/flag-sms', async (req, res) => {
   const matchId      = decodeURIComponent(req.query.matchId || '');
   const twiml        = new VoiceResponse();
 
-  const wantsText = digits === '1' || /\b(yes|si|text|texto|one|uno|1)\b/i.test(speech);
-  if (wantsText && logId) {
-    await base('CALL LOG').update(logId, { Caller_SMS_Requested: true }).catch(console.error);
-  }
+  // (No longer asked since 2026-11-10 — callers are always texted. Route kept for calls that were already
+  //  mid-flow during the deploy; it just goes on to the transfer.)
   // Always proceed to transfer
   twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}&type=${encodeURIComponent(req.query.type || 'Buyer')}`);
   res.type('text/xml').send(twiml.toString());
@@ -1255,18 +1328,11 @@ function buyerTenantFlow(res, twiml, { match, lang, callerNumber, callerType, ca
     ? `Perfecto, encontre ${speakableAddress(match.address)}.`
     : `Great, I found ${speakableAddress(match.address)}.`);
 
-  const gather = twiml.gather({
-    input: 'speech dtmf', numDigits: 1, timeout: 5, language: VOICE[lang].language,
-    hints: lang === 'es' ? 'si, texto, uno, 1' : 'yes, text, one, 1',
-    action: `${process.env.BASE_URL}/flag-sms?lang=${lang}&logId=${logId}&matchId=${encodeURIComponent(match.id)}&callerNumber=${encodeURIComponent(callerNumber)}&type=${callerType}`,
-    method: 'POST',
-  });
-
-  gather.say(VOICE[lang], lang === 'es'
-    ? `${partyES.charAt(0).toUpperCase() + partyES.slice(1)} coordina las visitas directamente, le transfiero ahora mismo. Oprima 1 o diga texto y le envio los datos de contacto por si no podemos comunicarle ahora.`
-    : `The ${partyEN} is handling showings directly. I will transfer your call right now. Press 1 or say text and I will also send you the ${partyEN}'s contact information in case we can't connect you now.`
+  // No "press 1 for a text" any more — every caller is texted after the call (see CALLER TEXT above).
+  say(twiml, lang, lang === 'es'
+    ? `${partyES.charAt(0).toUpperCase() + partyES.slice(1)} coordina las visitas directamente, le transfiero ahora mismo. Tambien le enviaremos un texto con los datos de contacto por si no podemos comunicarle ahora.`
+    : `The ${partyEN} is handling showings directly. I will transfer your call right now. We will also text you the ${partyEN}'s contact information in case we can't connect you now.`
   );
-  // Transfer even without SMS opt-in
   twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(match.id)}&logId=${logId}&type=${encodeURIComponent(callerType)}`);
   res.type('text/xml').send(twiml.toString());
 }
@@ -1666,27 +1732,11 @@ app.post('/universal-fallback', (req, res) => {
   const logId  = req.query.logId || '';
   const twiml  = new VoiceResponse();
 
-  const gather = twiml.gather({
-    input: 'speech dtmf', numDigits: 1, timeout: 6, speechTimeout: 'auto',
-    language: VOICE[lang].language,
-    hints: lang === 'es' ? 'si, uno, 1, no, dos, 2' : 'yes, one, 1, no, two, 2',
-    action: `${process.env.BASE_URL}/fallback-sms-choice?lang=${lang}&logId=${logId}`,
-    method: 'POST',
-  });
-  if (lang === 'es') {
-    gather.say(VOICE.es,
-      'Lo siento, no pude asistirle a traves de este servicio automatico. ' +
-      'Por favor deje un mensaje con su nombre y la direccion de la propiedad despues del tono y alguien le contactara pronto. ' +
-      'Podemos contactarle tambien por mensaje de texto? Oprima 1 para si o oprima 2 para no.'
-    );
-  } else {
-    gather.say(VOICE.en,
-      'I\'m sorry, I wasn\'t able to assist you through this automated service. ' +
-      'Please leave a message with your name and the property address after the tone and someone will contact you shortly. ' +
-      'Can we also reach you by text? Press 1 for yes or press 2 for no.'
-    );
-  }
-  say(twiml, lang, leaveMsg(lang));
+  // No "can we text you? press 1/2" any more — every caller is texted after the call.
+  say(twiml, lang, lang === 'es'
+    ? 'Lo siento, no pude asistirle a traves de este servicio automatico. Le enviaremos un texto, y por favor deje un mensaje con su nombre y la direccion de la propiedad despues del tono y alguien le contactara pronto.'
+    : 'I\'m sorry, I wasn\'t able to assist you through this automated service. We will also send you a text. Please leave a message with your name and the property address after the tone and someone will contact you shortly.'
+  );
   twiml.record({
     maxLength: 120, transcribe: true,
     transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=true`,
@@ -1701,9 +1751,8 @@ app.post('/fallback-sms-choice', async (req, res) => {
   const lang   = req.query.lang || 'en';
   const logId  = req.query.logId || '';
   const twiml  = new VoiceResponse();
-  if ((digits === '1' || /\b(yes|si|one|uno|1)\b/.test(speech)) && logId) {
-    await base('CALL LOG').update(logId, { Caller_SMS_Requested: true }).catch(console.error);
-  }
+  // (No longer asked since 2026-11-10 — callers are always texted. Route kept so a call that was already
+  //  mid-flow during the deploy does not hit a 404; it just goes on to the voicemail.)
   say(twiml, lang, leaveMsg(lang));
   twiml.record({
     maxLength: 120, transcribe: true,
