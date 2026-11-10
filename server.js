@@ -40,6 +40,30 @@ app.use((req, res, next) => {
   res.status(403).send('Forbidden');
 });
 
+// ─── CALLER NAME (CNAM) ──────────────────────────────────────────────────────
+// With "Caller Name Lookup" switched on for the Twilio number, every voice webhook carries CallerName.
+// Remember it per call (bounded, in memory) so the CALL LOG row and the seller alerts can use it.
+// Carriers often return filler ("WIRELESS CALLER", "UNKNOWN"…), which is dropped; blank is fine.
+const callerNames = new Map(); // callSid -> cleaned name
+function cleanCallerName(raw) {
+  const name = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!name || name.length > 60) return '';
+  if (!/[a-z]/i.test(name)) return '';   // digits/symbols only (e.g. the number again)
+  if (/^(unknown|unavailable|unavailable caller|wireless caller|wireless|toll free( caller)?|private|private caller|anonymous|restricted|null|n\/a|none|v\d*)$/i.test(name)) return '';
+  // CNAM is usually ALL CAPS ("JOHN SMITH") — make it readable
+  return name === name.toUpperCase() ? name.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase()) : name;
+}
+function callerNameFor(callSid) { return callerNames.get(callSid) || ''; }
+app.use((req, res, next) => {
+  const sid  = req.body && req.body.CallSid;
+  const name = req.body && cleanCallerName(req.body.CallerName);
+  if (sid && name && !callerNames.has(sid)) {
+    callerNames.set(sid, name);
+    if (callerNames.size > 500) callerNames.delete(callerNames.keys().next().value);
+  }
+  next();
+});
+
 // Airtable formula string literal: escapes \ " ' and wraps in double quotes,
 // so request values can't break out of the formula.
 function airtableStr(value) {
@@ -258,6 +282,7 @@ async function emailCompletedCallRecording(logId, recordingUrl, durationSecs) {
         <table style="font-size:14px;">
           ${row('Property', fields.Real_Address || fields.Property_Address)}
           ${row('Caller', [fields.Caller_Number, pick(fields.Caller_Type)].filter(Boolean).join(' · '))}
+          ${row('Caller name', fields.Caller_Name)}
           ${row('Language', pick(fields.Language))}
           ${row('Recorded length', mins)}
           ${row('Email sent', ts + ' ET')}
@@ -361,6 +386,7 @@ async function postCallSends(logId) {
     const logRecord          = await base('CALL LOG').find(logId);
     const callerSMSRequested = logRecord.get('Caller_SMS_Requested') || false;
     const callerNumber       = logRecord.get('Caller_Number') || '';
+    const callerName         = logRecord.get('Caller_Name')   || '';
     const callerType         = logRecord.get('Caller_Type')   || 'Buyer';
     const lang               = logRecord.get('Language') === 'Spanish' ? 'es' : 'en';
     // Try Listing_Link first — Airtable sometimes silently drops linked record
@@ -413,7 +439,7 @@ async function postCallSends(logId) {
     }
 
     // Seller notification (email always + SMS if consent)
-    const sellerSmsSent = await notifySeller({ record: listing, callerNumber, callerType, address, city });
+    const sellerSmsSent = await notifySeller({ record: listing, callerNumber, callerName, callerType, address, city });
     if (sellerSmsSent) {
       await base('CALL LOG').update(logId, { Seller_SMS_Sent: true }).catch(console.error);
     }
@@ -768,6 +794,7 @@ async function createLookupLog({ callSid, callerNumber, callerType, lang, spoken
       Caller_Type: callerType, Language: lang === 'es' ? 'Spanish' : 'English',
       Property_Address: spoken,
       Notes: `Caller consented to recording by continuing on the line (FL two-party notice at greeting).${extraNotes ? ` ${extraNotes}` : ''}`,
+      ...(callerNameFor(callSid) ? { Caller_Name: callerNameFor(callSid) } : {}),
       ...fields,
     });
     return rec.id;
@@ -1434,6 +1461,7 @@ app.post('/voicemail', async (req, res) => {
         Language: lang === 'es' ? 'Spanish' : 'English',
         Property_Address: 'No Address', Call_Disposition: 'Voicemail Left',
         Notes: `Reason: ${reason}. Caller consented to recording (FL two-party notice at greeting).`,
+        ...(callerNameFor(callSid) ? { Caller_Name: callerNameFor(callSid) } : {}),
       });
       logId = logRecord.id;
     } catch (err) { console.error('Voicemail log creation error:', err); }
@@ -1580,6 +1608,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
         Voicemail_URL: recordingUrl, Call_Disposition: match ? 'Voicemail Left' : 'No Match Found',
         Real_Address: match ? match.fullAddress : '',
         Listing_Link: match ? [match.id] : undefined,
+        ...(callerNameFor(callSid) ? { Caller_Name: callerNameFor(callSid) } : {}),
       });
       afterHoursLogId = logRecord.id;
     } catch (e) { console.error('After-hours log error:', e); }
@@ -1593,7 +1622,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
           <h2 style="color:#003087;">📞 After-Hours Call — Blue Lighthouse Realty</h2>
           <p>Dear ${match.name || 'Seller'},</p>
           <p>We received an after-hours call about your property at <strong>${match.fullAddress}</strong>.</p>
-          <p>Caller: <strong>${callerNumber}</strong></p>
+          <p>Caller: <strong>${callerNumber}</strong>${callerNameFor(callSid) ? ` (${callerNameFor(callSid).replace(/</g, '&lt;')})` : ''}</p>
           ${recordingLine}
           ${noteHtml}
           <h3>${spanishNote ? 'Automatic transcript (English-only — unreliable for Spanish)' : 'Transcript'}</h3>
@@ -1687,7 +1716,7 @@ app.post('/fallback-sms-choice', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // NOTIFY SELLER helper
 // ═══════════════════════════════════════════════════════════════════════════════
-async function notifySeller({ record, callerNumber, callerType, address, city }) {
+async function notifySeller({ record, callerNumber, callerName = '', callerType, address, city }) {
   const sellerEmail    = record.get('Email');
   const sellerPhone    = record.get('Phone');
   const sellerName     = record.get('Name') || 'Seller';
@@ -1703,7 +1732,7 @@ async function notifySeller({ record, callerNumber, callerType, address, city })
         <h2 style="color:#003087;">Call Notification — Blue Lighthouse Realty</h2>
         <p>Dear ${sellerName},</p>
         <p>${callerLabel.charAt(0).toUpperCase() + callerLabel.slice(1)} called about your property at <strong>${address}, ${city}</strong>.</p>
-        <p>Caller: <strong>${callerNumber}</strong></p>
+        <p>Caller: <strong>${callerNumber}</strong>${callerName ? ` (${String(callerName).replace(/</g, '&lt;')})` : ''}</p>
         <p>Please feel free to follow up directly.</p>
         <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p>
       </div>`,
@@ -1713,7 +1742,7 @@ async function notifySeller({ record, callerNumber, callerType, address, city })
   if (sellerPhone && airtableConsent) {
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER, to: sellerPhone,
-      body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${address}, ${city}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
+      body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${address}, ${city}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}${callerName ? ` (${callerName})` : ''}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
     }).catch(console.error);
     return true;
   }

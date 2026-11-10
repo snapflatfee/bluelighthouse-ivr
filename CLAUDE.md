@@ -117,6 +117,7 @@ Key fields used by the IVR:
 Key fields written by the IVR:
 - `Call_ID` — Twilio CallSid
 - `Call_Date`, `Caller_Number`, `Caller_Type`, `Language`
+- `Caller_Name` — carrier caller name (CNAM) from Twilio's Caller Name Lookup, only when real (see "Caller name" below)
 - `Property_Address` — what the caller said
 - `Real_Address`, `Prop_ID` — matched property
 - `Listing_Link` — linked record to ALL LISTINGS (sometimes silently dropped by Airtable on create — system uses `Prop_ID` as fallback in `postCallSends`)
@@ -176,8 +177,15 @@ Triggered by:
 ### `playTransferPrompt(twiml, lang, isRental, logId, matchId, callerNumber)`
 Shared prompt for ALL Realtor transfer paths. Offers SMS opt-in, then always transfers regardless.
 
-### `notifySeller({ record, callerNumber, callerType, address, city })`
-Sends seller email (always) and SMS (if `SMS_Recording_Consent = YES`). Returns `true` if SMS sent.
+### `notifySeller({ record, callerNumber, callerName, callerType, address, city })`
+Sends seller email (always) and SMS (if `SMS_Recording_Consent = YES`). Returns `true` if SMS sent. `callerName` is optional; when present it is shown as "(Name)" after the caller's number.
+
+### Caller name (CNAM) — added 2026-11-09
+Jorge asked for it ("does Twilio offer call ID? — No. 1"). **Needs a switch in Twilio:** Phone Numbers → the number → Voice configuration → **Caller Name Lookup** ON (about 1¢ per call; many cell numbers return no name). Until it is on, nothing changes and nothing breaks.
+- A small middleware remembers `CallerName` per `CallSid` (in-memory, max 500) the first time any webhook of that call carries it; `callerNameFor(callSid)` reads it. `cleanCallerName` drops filler ("WIRELESS CALLER", "UNKNOWN", "TOLL FREE", digits-only…) and turns ALL CAPS into Title Case.
+- It is written to the CALL LOG field **`Caller_Name`** (created 2026-11-09, `fldtNsBjrec4MjnWe`, single line text) at all three row-creation sites (`createLookupLog`, `/voicemail`, `/afterhours-transcribed`), and appears in the seller "Lead Call Received" email + SMS ("Caller's number: +1305… (John Smith)"), the after-hours seller email, and the "IVR - Completed Call Recording" email.
+- The `Caller_Name` field must exist in Airtable before this code is deployed (an unknown field name makes the CALL LOG create fail). It already does.
+- Names are only a hint — CNAM is often the account holder, not the person calling.
 
 ### `sendEmail({ to, subject, html })`
 HTTP POST to Resend API. Sends from `noreply@snapflatfee.com`, reply-to `snapflatfee@gmail.com`.

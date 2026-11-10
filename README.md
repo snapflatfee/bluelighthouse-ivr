@@ -105,7 +105,7 @@ SMS:
 - BAC Offered, Commission NOTES
 
 ### CALL LOG (written per call)
-- Call_ID, Call_Date, Caller_Number, Caller_Type, Language
+- Call_ID, Call_Date, Caller_Number, Caller_Name (only when Twilio's Caller Name Lookup is on and the carrier gives a real name), Caller_Type, Language
 - Property_Address (spoken), Real_Address, Prop_ID, Listing_Link
 - Call_Disposition, SMS_Sent, Seller_SMS_Sent, Seller_Notified, Caller_SMS_Requested, Seller_Accepted_Call
 - Voicemail_URL, Second_Leg_Recording_URL, Transcript
