@@ -96,7 +96,9 @@ app.post('/sms-inbound', async (req, res) => {
       const existing = records[0].get('Notes') || '';
       await base('CALL LOG').update(records[0].id, {
         Notes: existing + `\n[SMS REPLY ${new Date().toLocaleString('en-US',{timeZone:'America/New_York'})}]: ${body}`,
+        Handled: false, 'Handled at': null,     // a new reply re-opens it
       }).catch(console.error);
+      await updateCallSummary(records[0].id);
     }
   } catch (err) {
     console.error('SMS inbound log error:', err);
@@ -110,6 +112,7 @@ const twilioClient  = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const base          = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);
 const claude        = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const { summarizeCall, changedFields } = require('./lib/callSummary');
 
 // ─── Email via Resend (Railway blocks SMTP port 587 — use HTTP API instead) ──
 // Sign up free at resend.com, get API key, add RESEND_API_KEY to Railway env vars
@@ -292,6 +295,7 @@ async function emailCompletedCallRecording(logId, recordingUrl, durationSecs) {
         <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p></div>`,
       attachments: attach,
     });
+    base('CALL LOG').update(logId, { 'Recording emailed': true }).catch((e) => console.error('Recording emailed flag failed:', e.message));
   } catch (err) {
     emailedRecordingSids.delete(sid);   // let a later delivery of the same recording try again
     await alertError('emailing the completed call recording', err);
@@ -338,6 +342,19 @@ function scheduleRecordingBackfill(logId, callSids) {
 }
 
 // Append a line to a CALL LOG record's Notes (without wiping what's there).
+// Fills the plain-language columns (What happened, Outcome, Attention, Action needed, the ✓ columns) from the row.
+// Safe to call any number of times: it only writes what changed, and never throws. `extra` = event-only fields to
+// write along with it ('Voicemail emailed to'); `messageRecorded` overrides the derived value for a message that
+// has just been recorded but is not on the row yet.
+async function updateCallSummary(logId, { messageRecorded, extra } = {}) {
+  if (!logId) return;
+  try {
+    const rec = await base('CALL LOG').find(logId);
+    const diff = { ...changedFields(rec.fields || {}, summarizeCall(rec.fields || {}, { messageRecorded })), ...(extra || {}) };
+    if (Object.keys(diff).length) await base('CALL LOG').update(logId, diff);
+  } catch (e) { console.error('updateCallSummary failed:', e.message || e); }
+}
+
 async function appendNote(logId, text) {
   if (!logId) return;
   try {
@@ -486,11 +503,11 @@ async function postCallSends(logId, { callerOnly = false } = {}) {
 
     // Seller notification (email always + SMS if consent)
     if (listing && !callerOnly) {
-      const sellerSmsSent = await notifySeller({ record: listing, callerNumber, callerName, callerType, address, city });
-      if (sellerSmsSent) {
-        await base('CALL LOG').update(logId, { Seller_SMS_Sent: true }).catch(console.error);
-      }
+      const sent = await notifySeller({ record: listing, callerNumber, callerName, callerType, address, city });
+      const upd = { ...(sent.sms ? { Seller_SMS_Sent: true } : {}), ...(sent.email ? { 'Seller emailed': true } : {}) };
+      if (Object.keys(upd).length) await base('CALL LOG').update(logId, upd).catch(console.error);
     }
+    await updateCallSummary(logId);
   } catch (err) {
     console.error('postCallSends error:', err.message || err);
     postCallSentLogIds.delete(logId); // allow the /call-status backup to retry
@@ -592,6 +609,7 @@ app.post('/call-status', async (req, res) => {
           base('CALL LOG').update(id, { Call_Duration_Sec: secs }).catch((e) => console.error('Call_Duration_Sec update failed:', e.message));
         }
         setImmediate(() => postCallSends(id));
+        setTimeout(() => updateCallSummary(id), 4000).unref();   // after the duration + texts above have landed
       } else if (callStatus === 'completed' && !/^outbound/i.test(req.body.Direction || '')) {
         // No CALL LOG row at all: the caller hung up before a lookup/voicemail started.
         scheduleHangupFollowUp({ callSid, from: req.body.From || '', callerName: callerNameFor(callSid) });
@@ -1560,7 +1578,19 @@ app.post('/voicemail-done', (req, res) => {
   say(twiml, lang, lang === 'es' ? 'Gracias. Hasta pronto.' : 'Thank you. Goodbye.');
   twiml.hangup();
   res.type('text/xml').send(twiml.toString());
+  setImmediate(() => markMessageRecorded(req.body || {}));
 });
+
+// The recording has just ended (Twilio calls this even if the caller hung up while talking). Mark the row right
+// away — the transcript callback that normally does it can arrive minutes later, or never for a very short message.
+async function markMessageRecorded(body) {
+  const secs = parseInt(body.RecordingDuration, 10);
+  if (!body.CallSid || !body.RecordingUrl || !(secs >= 3)) return;
+  try {
+    const found = await base('CALL LOG').select({ filterByFormula: `{Call_ID}=${airtableStr(body.CallSid)}`, maxRecords: 1 }).firstPage();
+    if (found.length) await updateCallSummary(found[0].id, { messageRecorded: true });
+  } catch (e) { console.error('markMessageRecorded failed:', e.message || e); }
+}
 
 // ─── VOICEMAIL TRANSCRIBED ────────────────────────────────────────────────────
 app.post('/voicemail-transcribed', async (req, res) => {
@@ -1608,7 +1638,9 @@ app.post('/voicemail-transcribed', async (req, res) => {
     <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript || 'Pending...'}</p>`}
     <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p></div>`;
 
+  let emailedTo = '';
   if (isCommission) {
+    emailedTo = 'Office only (commission message)';
     // Commission branch → snapflatfee2 ONLY — do not email seller
     await sendEmail({
       from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
@@ -1617,6 +1649,7 @@ app.post('/voicemail-transcribed', async (req, res) => {
       attachments,
     }).catch(console.error);
   } else if (req.query.branch === 'seller' && sellerEmail) {
+    emailedTo = process.env.EMAIL_TO ? 'Seller + copy to Office' : 'Seller';
     // Seller unavailable/declined → message goes to the seller, copy to SnapFlatFee
     await sendEmail({
       to: sellerEmail,
@@ -1633,6 +1666,7 @@ app.post('/voicemail-transcribed', async (req, res) => {
       }).catch(console.error);
     }
   } else if (sellerEmail) {
+    emailedTo = 'FCHB seller';
     // FCHB: direct to seller
     await sendEmail({
       from: process.env.EMAIL_FROM, to: sellerEmail,
@@ -1641,6 +1675,7 @@ app.post('/voicemail-transcribed', async (req, res) => {
       attachments,
     }).catch(console.error);
   } else {
+    emailedTo = isAttention ? 'Office (needs attention)' : 'Office';
     // Normal flow
     await sendEmail({
       from: process.env.EMAIL_FROM,
@@ -1650,6 +1685,7 @@ app.post('/voicemail-transcribed', async (req, res) => {
       attachments,
     }).catch(console.error);
   }
+  if (logId) await updateCallSummary(logId, { messageRecorded: !!recordingUrl, extra: { 'Voicemail emailed to': emailedTo } });
   res.sendStatus(200);
 });
 
@@ -1690,6 +1726,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
     } catch (e) { console.error('After-hours log error:', e); }
     if (afterHoursLogId && recordingUrl) saveRecordingToAirtable(afterHoursLogId, recordingUrl, AT_FIELDS.voicemail, 'voicemail.mp3', attachments && attachments[0].content);
 
+    if (afterHoursLogId) await updateCallSummary(afterHoursLogId, { messageRecorded: !!recordingUrl, extra: { 'Voicemail emailed to': match && match.email ? 'Seller (after hours)' : 'Office' } });
     if (match && match.email) {
       await sendEmail({
         from: process.env.EMAIL_FROM, to: match.email,
@@ -1783,6 +1820,7 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
   const callerLabel    = callerType === 'Realtor' ? 'a Realtor' : 'a Direct Buyer';
   const callerLabelSMS = callerType === 'Realtor' ? 'Realtor' : 'Direct Buyer';
 
+  let emailSent = false;
   if (sellerEmail) {
     await sendEmail({
       from: process.env.EMAIL_FROM, to: sellerEmail,
@@ -1795,7 +1833,7 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
         <p>Please feel free to follow up directly.</p>
         <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p>
       </div>`,
-    }).catch(console.error);
+    }).then(() => { emailSent = true; }).catch(console.error);
   }
 
   if (sellerPhone && airtableConsent) {
@@ -1803,9 +1841,9 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
       from: process.env.TWILIO_PHONE_NUMBER, to: sellerPhone,
       body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${address}, ${city}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}${callerName ? ` (${callerName})` : ''}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
     }).catch(console.error);
-    return true;
+    return { sms: true, email: emailSent };
   }
-  return false;
+  return { sms: false, email: emailSent };
 }
 
 function buildRealtorSystemPrompt(lang, listingContext) {
