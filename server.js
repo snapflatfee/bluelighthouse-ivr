@@ -1589,13 +1589,23 @@ app.post('/voicemail-transcribed', async (req, res) => {
   const recordingLine = attachments
     ? `<p><b>Recording:</b> attached to this email (voicemail.mp3)</p>`
     : `<p><b>Recording:</b> <a href="${recordingUrl}">Listen</a> (requires Twilio Console login — attachment failed to fetch, see Railway logs)</p>`;
+  // Who called (number, carrier name, property) — from the CALL LOG row, so every voicemail email says who it is.
+  let lf = {};
+  if (logId) { try { lf = (await base('CALL LOG').find(logId)).fields || {}; } catch (e) { console.error('voicemail email: could not read CALL LOG:', e.message); } }
+  const esc = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const vmNumber = lf.Caller_Number || req.body.From || '';
+  const vmName   = lf.Caller_Name || callerNameFor(callSid);
+  const vmProp   = lf.Real_Address || (lf.Property_Address && lf.Property_Address !== 'No Address' ? lf.Property_Address : '');
+  const callerLine = vmNumber ? `<p><b>Caller:</b> ${esc(vmNumber)}${vmName ? ` (${esc(vmName)})` : ''}</p>` : '';
+  const propLine   = vmProp ? `<p><b>Property:</b> ${esc(vmProp)}</p>` : '';
   const html = (title, extra) => `<div style="font-family:Arial,sans-serif;max-width:600px;">
     <h2 style="color:#003087;">📞 ${title}</h2>
-    <p><b>Time:</b> ${ts}</p>${extra}
+    <p><b>Time:</b> ${ts}</p>${callerLine}${propLine}${extra}
     ${recordingLine}
-    ${spanishNote ? `<p style="background:#fff7e6;padding:10px 12px;border-left:4px solid #e35c21;"><b>Mensaje en español.</b> ${spanishNote}</p>` : ''}
-    <h3>${spanishNote ? 'Automatic transcript (English-only — unreliable for Spanish)' : 'Transcript'}</h3>
-    <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript || 'Pending...'}</p>
+    ${spanishNote
+      ? `<p style="background:#fff7e6;padding:10px 12px;border-left:4px solid #e35c21;"><b>Mensaje en español.</b> Listen to the recording — the automatic transcript only understands English, so it is left out.</p>`
+      : `<h3>Transcript</h3>
+    <p style="background:#f9f9f9;padding:12px;border-left:4px solid #003087;">${transcript || 'Pending...'}</p>`}
     <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p></div>`;
 
   if (isCommission) {
