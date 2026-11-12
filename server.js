@@ -1852,5 +1852,35 @@ function buildRealtorSystemPrompt(lang, listingContext) {
     : `You are the assistant for Jorge Zea, Real Estate Broker. Respond ONLY in English.\nDATA: ${listingContext}\nMax 2 sentences. Professional, warm tone.`;
 }
 
+// ─── SELF-FILL: any recent call whose plain-language columns are still blank ──────────────────────
+// Runs shortly after every start and then hourly, so a call is never left blank for long even if a live update
+// failed (Airtable hiccup, restart mid-call…). Rows younger than 5 minutes are left to the live path (the call may
+// still be going). SUMMARY_BACKFILL=off disables it.
+const SUMMARY_MIN_AGE_MS = 5 * 60 * 1000;
+let summaryBackfillRunning = false;
+async function backfillCallSummaries() {
+  if (summaryBackfillRunning || (process.env.SUMMARY_BACKFILL || 'on').toLowerCase() === 'off') return 0;
+  summaryBackfillRunning = true;
+  let done = 0;
+  try {
+    const rows = await base('CALL LOG').select({ maxRecords: 200, sort: [{ field: 'Call_Date', direction: 'desc' }], fields: ['Call_Date', 'Outcome'] }).firstPage();
+    for (const r of rows) {
+      if (r.get('Outcome')) continue;
+      const when = Date.parse(r.get('Call_Date') || '');
+      if (Number.isFinite(when) && Date.now() - when < SUMMARY_MIN_AGE_MS) continue;
+      await updateCallSummary(r.id);
+      done += 1;
+      await new Promise((ok) => setTimeout(ok, parseInt(process.env.SUMMARY_BACKFILL_PAUSE_MS, 10) || 500));   // stay under Airtable's rate limit
+    }
+    if (done) console.log(`Call summaries: filled ${done} blank call(s)`);
+  } catch (e) { console.error('backfillCallSummaries failed:', e.message || e); }
+  finally { summaryBackfillRunning = false; }
+  return done;
+}
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🏠 Blue Lighthouse IVR v3.0 running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🏠 Blue Lighthouse IVR v3.0 running on port ${PORT}`);
+  setTimeout(backfillCallSummaries, parseInt(process.env.SUMMARY_BACKFILL_DELAY_MS, 10) || 30000).unref();
+  setInterval(backfillCallSummaries, parseInt(process.env.SUMMARY_BACKFILL_INTERVAL_MS, 10) || 60 * 60 * 1000).unref();
+});
