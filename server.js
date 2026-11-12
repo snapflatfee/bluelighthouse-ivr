@@ -284,7 +284,7 @@ async function emailCompletedCallRecording(logId, recordingUrl, durationSecs) {
         <h2 style="color:#003087;">🎙️ Completed call recording</h2>
         <table style="font-size:14px;">
           ${row('Property', fields.Real_Address || fields.Property_Address)}
-          ${row('Caller', [fields.Caller_Number, pick(fields.Caller_Type)].filter(Boolean).join(' · '))}
+          ${row('Caller', [prettyPhone(fields.Caller_Number), pick(fields.Caller_Type)].filter(Boolean).join(' · '))}
           ${row('Caller name', fields.Caller_Name)}
           ${row('Language', pick(fields.Language))}
           ${row('Recorded length', mins)}
@@ -407,6 +407,17 @@ const callerSmsOn = () => (process.env.CALLER_SMS || 'on').toLowerCase() !== 'of
 
 // The Address column often already holds the whole address ("8743 The Esplanade , Orlando, FL 32836"), so adding
 // City / State / Zip again printed it twice. Tidy spacing, then add only the parts that are not already there.
+// +13055550301 / 13055550301 / (305) 555 0301 -> 305-555-0301. Display only: stored and dialled numbers stay +1.
+// Anything that is not a US/Canada number (international, "anonymous", blank) is shown as it came.
+function prettyPhone(n) {
+  const raw = String(n == null ? '' : n).trim();
+  const d = raw.replace(/\D/g, '');
+  const us11 = d.length === 11 && d[0] === '1';
+  const t = us11 ? d.slice(1) : (d.length === 10 && !raw.startsWith('+') ? d : '');   // "+" + 10 digits is international
+  if (!t) return raw;
+  return `${t.slice(0, 3)}-${t.slice(3, 6)}-${t.slice(6)}`;
+}
+
 function tidyAddress(address, ...extras) {
   const a = String(address || '').replace(/\s+,/g, ',').replace(/,(\s*,)+/g, ',').replace(/\s{2,}/g, ' ').replace(/[,\s]+$/, '').trim();
   const has = (part) => new RegExp(`(^|[^A-Za-z0-9])${String(part).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Za-z0-9])`, 'i').test(a);
@@ -423,7 +434,7 @@ function callerSmsBody({ lang, listing, fullAddr, transferred }) {
     return lang === 'es' ? es + ES_TAIL : lang === 'en' ? en + EN_TAIL : `${en}${EN_TAIL}\n\n${es}${ES_TAIL}`;   // both languages: each paragraph carries its own STOP line
   }
   const isRental = /rent|lease|alquil/i.test((listing.get('Type') || '').toString());
-  const phone = (listing.get('Phone') || '').toString().trim();
+  const phone = prettyPhone((listing.get('Phone') || '').toString().trim());
   const email = (listing.get('Email') || '').toString().trim();
   const contactEN = [phone && `Phone: ${phone}`, email && `Email: ${email}`].filter(Boolean).join('. ');
   const partyEN = isRental ? 'Landlord' : 'Seller';
@@ -1653,7 +1664,7 @@ app.post('/voicemail-transcribed', async (req, res) => {
   const vmNumber = lf.Caller_Number || req.body.From || '';
   const vmName   = lf.Caller_Name || callerNameFor(callSid);
   const vmProp   = lf.Real_Address || (lf.Property_Address && lf.Property_Address !== 'No Address' ? lf.Property_Address : '');
-  const callerLine = vmNumber ? `<p><b>Caller:</b> ${esc(vmNumber)}${vmName ? ` (${esc(vmName)})` : ''}</p>` : '';
+  const callerLine = vmNumber ? `<p><b>Caller:</b> ${esc(prettyPhone(vmNumber))}${vmName ? ` (${esc(vmName)})` : ''}</p>` : '';
   const propLine   = vmProp ? `<p><b>Property:</b> ${esc(vmProp)}</p>` : '';
   const html = (title, extra) => `<div style="font-family:Arial,sans-serif;max-width:600px;">
     <h2 style="color:#003087;">📞 ${title}</h2>
@@ -1762,7 +1773,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
           <h2 style="color:#003087;">📞 After-Hours Call — Blue Lighthouse Realty</h2>
           <p>Dear ${match.name || 'Seller'},</p>
           <p>We received an after-hours call about your property at <strong>${match.fullAddress}</strong>.</p>
-          <p>Caller: <strong>${callerNumber}</strong>${callerNameFor(callSid) ? ` (${callerNameFor(callSid).replace(/</g, '&lt;')})` : ''}</p>
+          <p>Caller: <strong>${prettyPhone(callerNumber)}</strong>${callerNameFor(callSid) ? ` (${callerNameFor(callSid).replace(/</g, '&lt;')})` : ''}</p>
           ${recordingLine}
           ${noteHtml}
           <h3>${spanishNote ? 'Automatic transcript (English-only — unreliable for Spanish)' : 'Transcript'}</h3>
@@ -1777,7 +1788,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
         subject: 'IVR — After-hours call (no match)',
         html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
           <h2 style="color:#003087;">📞 After-Hours Voicemail — No Match</h2>
-          <p><b>Time:</b> ${ts}</p><p><b>Caller:</b> ${callerNumber}</p>
+          <p><b>Time:</b> ${ts}</p><p><b>Caller:</b> ${prettyPhone(callerNumber)}</p>
           ${recordingLine}
           ${noteHtml}
           <p>${transcript || '(no transcript)'}</p>
@@ -1791,7 +1802,7 @@ app.post('/afterhours-transcribed', async (req, res) => {
     await sendEmail({
       from: process.env.EMAIL_FROM, to: 'snapflatfee2@gmail.com',
       subject: 'IVR — After-hours call (error)',
-      html: `<p>Error processing. Caller: ${callerNumber}. ${attachments ? 'Recording attached.' : `<a href="${recordingUrl}">Listen</a> (requires Twilio Console login)`} Transcript: ${transcript}</p>`,
+      html: `<p>Error processing. Caller: ${prettyPhone(callerNumber)}. ${attachments ? 'Recording attached.' : `<a href="${recordingUrl}">Listen</a> (requires Twilio Console login)`} Transcript: ${transcript}</p>`,
       attachments,
     }).catch(console.error);
   }
@@ -1857,7 +1868,7 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
         <h2 style="color:#003087;">Call Notification — Blue Lighthouse Realty</h2>
         <p>Dear ${sellerName},</p>
         <p>${callerLabel.charAt(0).toUpperCase() + callerLabel.slice(1)} called about your property at <strong>${where}</strong>.</p>
-        <p>Caller: <strong>${callerNumber}</strong>${callerName ? ` (${String(callerName).replace(/</g, '&lt;')})` : ''}</p>
+        <p>Caller: <strong>${prettyPhone(callerNumber)}</strong>${callerName ? ` (${String(callerName).replace(/</g, '&lt;')})` : ''}</p>
         <p>Please feel free to follow up directly.</p>
         <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p>
       </div>`,
@@ -1871,7 +1882,7 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
     let smsSent = false;
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER, to: smsTo,
-      body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${where}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}${callerName ? ` (${callerName})` : ''}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
+      body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${where}. From a ${callerLabelSMS}. Caller's number: ${prettyPhone(callerNumber)}${callerName ? ` (${callerName})` : ''}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
     }).then(() => { smsSent = true; }).catch((e) => console.error('Seller SMS error:', e.message));
     return { sms: smsSent, email: emailSent };
   }
