@@ -411,7 +411,7 @@ function callerSmsBody({ lang, listing, fullAddr, transferred }) {
   if (!listing) {
     const en = `Hi, it appears you just called the Office of Jorge Zea (Broker) but we couldn't connect or get the property address. Feel free to text us back and tell us how we can assist you.`;
     const es = `Hola, parece que llamo a la oficina de Jorge Zea (Corredor) pero no pudimos comunicarnos ni obtener la direccion de la propiedad. Envienos un texto y digenos como podemos ayudarle.`;
-    return lang === 'es' ? es + ES_TAIL : lang === 'en' ? en + EN_TAIL : `${en}\n\n${es}${ES_TAIL}`;
+    return lang === 'es' ? es + ES_TAIL : lang === 'en' ? en + EN_TAIL : `${en}${EN_TAIL}\n\n${es}${ES_TAIL}`;   // both languages: each paragraph carries its own STOP line
   }
   const isRental = /rent|lease|alquil/i.test((listing.get('Type') || '').toString());
   const phone = (listing.get('Phone') || '').toString().trim();
