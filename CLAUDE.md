@@ -216,6 +216,14 @@ SMS history is not stored in Airtable — the Manager Dashboard reads it live fr
 ### FCHB (Florida Cash Home Buyers)
 Emails `kevin@floridacashhomebuyers.com` or `alejandro@floridacashhomebuyers.com` → skip all transfer logic, go straight to voicemail, email transcript directly to that seller. Checked AFTER address match and AFTER Realtor/Buyer branch decision, inside `realtorFlow` and `buyerTenantFlow`.
 
+**FCHB is NOT a live transfer** (Jorge's wording on 2026-11-11 was "transferring directly" — he meant "routed straight to voicemail as soon as the property is matched", no questions asked). What FCHB gets, all automatic:
+- the caller leaves a voicemail → recorded, saved in CALL LOG `Voicemail_File`, emailed to the FCHB address (Outcome *Message sent to FCHB*);
+- the lead-alert **email** (`notifySeller`);
+- (2026-11-11) the standard lead-alert **text** to the `Phone` in ALL LISTINGS — same wording as every seller ("Lead alert from SnapFlatFee.com. Call received inquiring about your property: … From a Realtor/Direct Buyer. Caller's number: … (CNAM name)…"). For FCHB it is sent **even without `SMS_Recording_Consent = Yes I Agree`** (`isFchb` in `notifySeller`) — Jorge's decision, FCHB is our own account; every other seller still needs the flag. A text that Twilio rejects is no longer counted as sent.
+- If a live transfer to FCHB is ever wanted, that is a different change (it would need the transfer path + `Dial record`, which already records).
+**Phone numbers** are normalized by `toE164()` (`954-419-5097`, `(954) 419 5097`, `19544195097`, `+1…` → `+19544195097`); anything that is not a valid number is skipped (the email still goes out).
+**Voicemail safety net:** `/voicemail-done` (fires even if the transcript callback never does) calls `markMessageRecorded`, which now also, `VOICEMAIL_FALLBACK_DELAY_MS` (default 150 s) later, saves the audio to `Voicemail_File` if the transcript callback has not already done so. The voicemail **email** still depends on the transcript callback (not built).
+
 ### Recordings: emailed as attachments + saved into Airtable (rewritten 2026-11-09)
 - **CONFIRMED FIXED 2026-11-09 (live test):** after the `record-from-answer-dual` change, a 163s transferred call produced a 42.5s stereo MP3 (64 kbps) in the MP3 field, plus `Second_Leg_Recording_URL`, `Call_Duration_Sec` = 163, and the voicemail landed in `Voicemail_File`.
 - **ROOT CAUSE found 2026-11-09:** the `<Dial record=…>` value was `record-from-answer-dual-channel`, which is **not a valid Twilio value** (valid: `record-from-answer`, `record-from-ringing`, `record-from-answer-dual`, `record-from-ringing-dual`). Twilio ignored it, so **calls with sellers were never recorded** (that's why no CALL LOG row ever had `Second_Leg_Recording_URL`). Now `record-from-answer-dual`. If a recording is missing again, first check Twilio Console → Monitor → Recordings for a Dial-sourced recording before debugging Airtable.

@@ -1588,7 +1588,21 @@ async function markMessageRecorded(body) {
   if (!body.CallSid || !body.RecordingUrl || !(secs >= 3)) return;
   try {
     const found = await base('CALL LOG').select({ filterByFormula: `{Call_ID}=${airtableStr(body.CallSid)}`, maxRecords: 1 }).firstPage();
-    if (found.length) await updateCallSummary(found[0].id, { messageRecorded: true });
+    if (found.length) {
+      await updateCallSummary(found[0].id, { messageRecorded: true });
+      // Safety net: the voicemail file is normally saved when Twilio's transcript arrives. If that never comes
+      // (it can be missing for a short or non-English message), save the audio ourselves a little later.
+      const logId = found[0].id;
+      setTimeout(async () => {
+        try {
+          const row = await base('CALL LOG').find(logId);
+          if ((row.get('Voicemail_File') || []).length) return;
+          console.log(`voicemail ${body.CallSid}: no transcript callback — saving the recording to CALL LOG ${logId} directly`);
+          await saveRecordingToAirtable(logId, body.RecordingUrl, AT_FIELDS.voicemail, 'voicemail.mp3');
+          if (!row.get('Voicemail_URL')) await base('CALL LOG').update(logId, { Voicemail_URL: body.RecordingUrl }).catch(() => {});
+        } catch (e) { console.error('voicemail fallback save failed:', e.message || e); }
+      }, parseInt(process.env.VOICEMAIL_FALLBACK_DELAY_MS, 10) || 150000).unref();
+    }
   } catch (e) { console.error('markMessageRecorded failed:', e.message || e); }
 }
 
@@ -1836,14 +1850,28 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
     }).then(() => { emailSent = true; }).catch(console.error);
   }
 
-  if (sellerPhone && airtableConsent) {
+  // FCHB (our account) always gets the lead alert text on the Phone in Airtable, even without the consent flag.
+  const isFchb = FCHB_EMAILS.includes(String(sellerEmail || '').toLowerCase());
+  const smsTo  = toE164(sellerPhone);
+  if (smsTo && (airtableConsent || isFchb)) {
+    let smsSent = false;
     await twilioClient.messages.create({
-      from: process.env.TWILIO_PHONE_NUMBER, to: sellerPhone,
+      from: process.env.TWILIO_PHONE_NUMBER, to: smsTo,
       body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${address}, ${city}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}${callerName ? ` (${callerName})` : ''}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
-    }).catch(console.error);
-    return { sms: true, email: emailSent };
+    }).then(() => { smsSent = true; }).catch((e) => console.error('Seller SMS error:', e.message));
+    return { sms: smsSent, email: emailSent };
   }
   return { sms: false, email: emailSent };
+}
+
+// Airtable phones come as "954-419-5097", "(954) 419 5097", "+19544195097"… Twilio wants +1XXXXXXXXXX.
+function toE164(p) {
+  const raw = String(p == null ? '' : p).trim();
+  const d = raw.replace(/\D/g, '');
+  if (raw.startsWith('+') && d.length >= 8) return `+${d}`;
+  if (d.length === 10) return `+1${d}`;
+  if (d.length === 11 && d[0] === '1') return `+${d}`;
+  return '';
 }
 
 function buildRealtorSystemPrompt(lang, listingContext) {
