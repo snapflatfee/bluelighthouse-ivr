@@ -405,6 +405,15 @@ const CALLER_SMS_REPEAT_MS = 30 * 60 * 1000;   // same number + same property: o
 const recentCallerSms = new Map();
 const callerSmsOn = () => (process.env.CALLER_SMS || 'on').toLowerCase() !== 'off';
 
+// The Address column often already holds the whole address ("8743 The Esplanade , Orlando, FL 32836"), so adding
+// City / State / Zip again printed it twice. Tidy spacing, then add only the parts that are not already there.
+function tidyAddress(address, ...extras) {
+  const a = String(address || '').replace(/\s+,/g, ',').replace(/,(\s*,)+/g, ',').replace(/\s{2,}/g, ' ').replace(/[,\s]+$/, '').trim();
+  const has = (part) => new RegExp(`(^|[^A-Za-z0-9])${String(part).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Za-z0-9])`, 'i').test(a);
+  const missing = extras.map((x) => String(x == null ? '' : x).trim()).filter((x) => x && !has(x));
+  return [a, missing.join(' ')].filter(Boolean).join(', ');
+}
+
 function callerSmsBody({ lang, listing, fullAddr, transferred }) {
   const EN_TAIL = '\n\nMsg & data rates may apply. Reply STOP to opt out.';
   const ES_TAIL = '\n\nTarifas pueden aplicar. Responda STOP para cancelar.';
@@ -419,13 +428,17 @@ function callerSmsBody({ lang, listing, fullAddr, transferred }) {
   const contactEN = [phone && `Phone: ${phone}`, email && `Email: ${email}`].filter(Boolean).join('. ');
   const partyEN = isRental ? 'Landlord' : 'Seller';
   const partyES = isRental ? 'el propietario' : 'el vendedor';
+  // FCHB callers go straight to voicemail (never "transferred"), but Jorge wants them to have the contact details too.
+  const fchb = FCHB_EMAILS.includes(email.toLowerCase());
   if (lang === 'es') {
     return `Gracias por llamar a la oficina de Jorge Zea (Corredor). Ref: ${fullAddr}.` +
       (transferred && contactEN ? ` Por si no logro comunicarse con ${partyES}: ${contactEN}.` : '') +
+      (!transferred && fchb && contactEN ? ` Para comunicarse directamente con ${partyES}: ${contactEN}.` : '') +
       ` Estamos a su disposicion para cualquier pregunta, solo responda a este texto.${ES_TAIL}`;
   }
   return `Thanks for calling the Office of Jorge Zea (Broker). Ref: ${fullAddr}.` +
     (transferred && contactEN ? ` In case you couldn't connect with the ${partyEN}: ${contactEN}.` : '') +
+    (!transferred && fchb && contactEN ? ` To reach the ${partyEN} directly: ${contactEN}.` : '') +
     ` We are available to answer any questions, just text us back.${EN_TAIL}`;
 }
 
@@ -493,7 +506,7 @@ async function postCallSends(logId, { callerOnly = false } = {}) {
     const city    = listing ? (listing.get('City') || '') : '';
     const state   = listing ? (listing.get('State') || '') : '';
     const zip     = listing ? (listing.get('Zip code') || '') : '';
-    const fullAddr = [address, [city, state, zip].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+    const fullAddr = tidyAddress(address, city, state, zip);
 
     // SMS to the caller — always (see CALLER TEXT above)
     if (callerNumber) {
@@ -1833,16 +1846,17 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
   const airtableConsent = (record.get('SMS_Recording_Consent') || '').toString().trim() === 'Yes I Agree';
   const callerLabel    = callerType === 'Realtor' ? 'a Realtor' : 'a Direct Buyer';
   const callerLabelSMS = callerType === 'Realtor' ? 'Realtor' : 'Direct Buyer';
+  const where          = tidyAddress(address, city);
 
   let emailSent = false;
   if (sellerEmail) {
     await sendEmail({
       from: process.env.EMAIL_FROM, to: sellerEmail,
-      subject: `SnapFlatFee Lead Call Received. ${address}, ${city}`,
+      subject: `SnapFlatFee Lead Call Received. ${where}`,
       html: `<div style="font-family:Arial,sans-serif;max-width:600px;">
         <h2 style="color:#003087;">Call Notification — Blue Lighthouse Realty</h2>
         <p>Dear ${sellerName},</p>
-        <p>${callerLabel.charAt(0).toUpperCase() + callerLabel.slice(1)} called about your property at <strong>${address}, ${city}</strong>.</p>
+        <p>${callerLabel.charAt(0).toUpperCase() + callerLabel.slice(1)} called about your property at <strong>${where}</strong>.</p>
         <p>Caller: <strong>${callerNumber}</strong>${callerName ? ` (${String(callerName).replace(/</g, '&lt;')})` : ''}</p>
         <p>Please feel free to follow up directly.</p>
         <br/><p>Attn: Jorge Zea at SnapFlatFee.com®</p>
@@ -1857,7 +1871,7 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
     let smsSent = false;
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER, to: smsTo,
-      body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${address}, ${city}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}${callerName ? ` (${callerName})` : ''}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
+      body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${where}. From a ${callerLabelSMS}. Caller's number: ${callerNumber}${callerName ? ` (${callerName})` : ''}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
     }).then(() => { smsSent = true; }).catch((e) => console.error('Seller SMS error:', e.message));
     return { sms: smsSent, email: emailSent };
   }
