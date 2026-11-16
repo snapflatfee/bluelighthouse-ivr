@@ -439,17 +439,13 @@ function callerSmsBody({ lang, listing, fullAddr, transferred }) {
   const contactEN = [phone && `Phone: ${phone}`, email && `Email: ${email}`].filter(Boolean).join('. ');
   const partyEN = isRental ? 'Landlord' : 'Seller';
   const partyES = isRental ? 'el propietario' : 'el vendedor';
-  // FCHB callers go straight to voicemail (never "transferred"), but Jorge wants them to have the contact details too.
-  const fchb = FCHB_EMAILS.includes(email.toLowerCase());
   if (lang === 'es') {
     return `Gracias por llamar a la oficina de Jorge Zea (Corredor). Ref: ${fullAddr}.` +
       (transferred && contactEN ? ` Por si no logro comunicarse con ${partyES}: ${contactEN}.` : '') +
-      (!transferred && fchb && contactEN ? ` Para comunicarse directamente con ${partyES}: ${contactEN}.` : '') +
       ` Estamos a su disposicion para cualquier pregunta, solo responda a este texto.${ES_TAIL}`;
   }
   return `Thanks for calling the Office of Jorge Zea (Broker). Ref: ${fullAddr}.` +
     (transferred && contactEN ? ` In case you couldn't connect with the ${partyEN}: ${contactEN}.` : '') +
-    (!transferred && fchb && contactEN ? ` To reach the ${partyEN} directly: ${contactEN}.` : '') +
     ` We are available to answer any questions, just text us back.${EN_TAIL}`;
 }
 
@@ -577,24 +573,6 @@ function playTransferPrompt(twiml, lang, isRental, logId, matchId, callerNumber)
     : `The ${partyEN} handles showings and will answer any questions directly. Transferring your call right now. We will also text you the ${partyEN}'s contact information in case we can't connect you now.`
   );
   twiml.redirect(`${process.env.BASE_URL}/transfer-seller?lang=${lang}&matchId=${encodeURIComponent(matchId)}&logId=${logId}&type=Realtor`);
-}
-
-// ─── FCHB SPECIAL CASE ───────────────────────────────────────────────────────
-const FCHB_EMAILS = ['kevin@floridacashhomebuyers.com', 'alejandro@floridacashhomebuyers.com'];
-async function handleFCHB(res, twiml, { match, lang, logId }) {
-  // (Call_Disposition has no "FCHB" option in Airtable — writing one is rejected — so use Voicemail Left + a note.)
-  if (logId) await base('CALL LOG').update(logId, { Call_Disposition: 'Voicemail Left' }).catch(console.error);
-  appendNote(logId, 'FCHB property — routed directly to voicemail per account rule.');
-  say(twiml, lang, lang === 'es'
-    ? `Gracias. ${MSG_ES} Se lo haremos llegar al propietario de inmediato.`
-    : `Thank you. ${MSG_EN} We will forward it to the property owner right away.`
-  );
-  twiml.record({
-    maxLength: 120, transcribe: true,
-    transcribeCallback: `${process.env.BASE_URL}/voicemail-transcribed?logId=${logId}&lang=${lang}&attention=false&sellerEmail=${encodeURIComponent(match.email)}`,
-    action: `${process.env.BASE_URL}/voicemail-done?lang=${lang}`, method: 'POST',
-  });
-  return res.type('text/xml').send(twiml.toString());
 }
 
 // ─── AIRTABLE HEALTH CHECK ────────────────────────────────────────────────────
@@ -1168,9 +1146,6 @@ function speakableAddress(a) {
 }
 
 function realtorFlow(res, twiml, { match, lang, callerNumber, callSid, logId }) {
-  if (FCHB_EMAILS.includes((match.email || '').toLowerCase())) {
-    return handleFCHB(res, twiml, { match, lang, logId });
-  }
   const isRental = /rent|lease|alquil/i.test(match.type || '');
   say(twiml, lang, lang === 'es'
     ? `Perfecto, encontre ${speakableAddress(match.address)}.`
@@ -1360,9 +1335,6 @@ app.post('/flag-sms', async (req, res) => {
 // STEP 4B — BUYER / TENANT FLOW
 // ═══════════════════════════════════════════════════════════════════════════════
 function buyerTenantFlow(res, twiml, { match, lang, callerNumber, callerType, callSid, logId }) {
-  if (FCHB_EMAILS.includes((match.email || '').toLowerCase())) {
-    return handleFCHB(res, twiml, { match, lang, logId });
-  }
   const isRental = /rent|lease|alquil/i.test(match.type || '');
   const partyEN  = isRental ? 'landlord' : 'seller';
   const partyES  = isRental ? 'el propietario' : 'el vendedor';
@@ -1703,15 +1675,6 @@ app.post('/voicemail-transcribed', async (req, res) => {
         attachments,
       }).catch(console.error);
     }
-  } else if (sellerEmail) {
-    emailedTo = 'FCHB seller';
-    // FCHB: direct to seller
-    await sendEmail({
-      from: process.env.EMAIL_FROM, to: sellerEmail,
-      subject: 'Voicemail received for your listing',
-      html: html('Voicemail — Blue Lighthouse Realty', `<p><b>Call SID:</b> ${callSid}</p>`),
-      attachments,
-    }).catch(console.error);
   } else {
     emailedTo = isAttention ? 'Office (needs attention)' : 'Office';
     // Normal flow
@@ -1875,10 +1838,8 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
     }).then(() => { emailSent = true; }).catch(console.error);
   }
 
-  // FCHB (our account) always gets the lead alert text on the Phone in Airtable, even without the consent flag.
-  const isFchb = FCHB_EMAILS.includes(String(sellerEmail || '').toLowerCase());
   const smsTo  = toE164(sellerPhone);
-  if (smsTo && (airtableConsent || isFchb)) {
+  if (smsTo && airtableConsent) {
     let smsSent = false;
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER, to: smsTo,

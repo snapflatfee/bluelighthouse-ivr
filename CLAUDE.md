@@ -113,7 +113,7 @@ Key fields used by the IVR:
 - `UniqueID` — unique ID (e.g. `ONBRD_00185`), used as fallback when `Listing_Link` is empty. **Renamed from `prop_id` in Airtable between 2026-09-21 and 2026-10-15**; the IVR asks Airtable for fields by name, so a renamed field breaks every lookup — check `/test-airtable` after any Airtable rename. (CALL LOG still has its own `Prop_ID` field, unchanged.)
 - `SMS_Recording_Consent` — singleSelect, actual choices are `Yes I Agree` / `No I Don't Agree`. Code does an exact-string check for `'Yes I Agree'` (`server.js:1270`) — drives seller SMS in `notifySeller()`. There's a separate `Call_Recording_Consent` field on this table too, but it's not referenced anywhere in server.js.
 - `BAC Offered`, `Commission NOTES` — for Realtor disclosure
-- `Email` — for FCHB special case routing (see below)
+- `Email` — seller's email (lead-alert email, seller voicemail copy)
 
 ### Table: CALL LOG
 Key fields written by the IVR:
@@ -143,7 +143,6 @@ The CALL LOG table also has `Seller_SMS_Sent copy`, `SMS_Confirmed`, and `SMS_Co
               └── /lookup-property (Fuse.js match → Airtable)
                     ├── No match → voicemail → snapflatfee2@gmail.com
                     ├── Inactive → "no longer available" → optional voicemail
-                    ├── FCHB email? → /handleFCHB → voicemail → seller directly
                     ├── Realtor → /realtorFlow → /realtor-branch
                     │     ├── Press 1 (showing) → playTransferPrompt ("we'll also text you") → transfer
                     │     └── Press 2 (other) → /realtor-question
@@ -213,21 +212,16 @@ SMS history is not stored in Airtable — the Manager Dashboard reads it live fr
 
 ## Special Cases
 
-### FCHB (Florida Cash Home Buyers)
-Emails `kevin@floridacashhomebuyers.com` or `alejandro@floridacashhomebuyers.com` → skip all transfer logic, go straight to voicemail, email transcript directly to that seller. Checked AFTER address match and AFTER Realtor/Buyer branch decision, inside `realtorFlow` and `buyerTenantFlow`.
-
-**FCHB is NOT a live transfer** (Jorge's wording on 2026-11-11 was "transferring directly" — he meant "routed straight to voicemail as soon as the property is matched", no questions asked). What FCHB gets, all automatic:
-- the caller leaves a voicemail → recorded, saved in CALL LOG `Voicemail_File`, emailed to the FCHB address (Outcome *Message sent to FCHB*);
-- the lead-alert **email** (`notifySeller`);
-- (2026-11-11) the standard lead-alert **text** to the `Phone` in ALL LISTINGS — same wording as every seller ("Lead alert from SnapFlatFee.com. Call received inquiring about your property: … From a Realtor/Direct Buyer. Caller's number: … (CNAM name)…"). For FCHB it is sent **even without `SMS_Recording_Consent = Yes I Agree`** (`isFchb` in `notifySeller`) — Jorge's decision, FCHB is our own account; every other seller still needs the flag. A text that Twilio rejects is no longer counted as sent.
-- If a live transfer to FCHB is ever wanted, that is a different change (it would need the transfer path + `Dial record`, which already records).
-**Phone numbers** are normalized by `toE164()` (`954-419-5097`, `(954) 419 5097`, `19544195097`, `+1…` → `+19544195097`); anything that is not a valid number is skipped (the email still goes out).
-**Voicemail safety net:** `/voicemail-done` (fires even if the transcript callback never does) calls `markMessageRecorded`, which now also, `VOICEMAIL_FALLBACK_DELAY_MS` (default 150 s) later, saves the audio to `Voicemail_File` if the transcript callback has not already done so. The voicemail **email** still depends on the transcript callback (not built).
+### FCHB (Florida Cash Home Buyers) — NO LONGER A SPECIAL CASE (removed 2026-11-16)
+Until 2026-11-16 listings whose `Email` was `kevin@` / `alejandro@floridacashhomebuyers.com` skipped everything and went straight to voicemail (`handleFCHB`, `FCHB_EMAILS`), with extras added 2026-11-11 (lead-alert text without the consent flag, seller contact in the caller's text). **Jorge removed all of it: FCHB listings are treated exactly like every other listing** — same menus, same transfer to the `Phone` in Airtable, same recording, lead-alert **email always**, lead-alert **text only if `SMS_Recording_Consent = Yes I Agree`**, caller text with seller contact only if the caller was transferred. **Do not re-add an FCHB branch.** What was kept because it helps everyone: `toE164()` phone normalization, the voicemail-audio safety net, `tidyAddress()`, `prettyPhone()`.
+- Their Airtable `Phone` values were updated on 2026-11-11 (kevin 954-419-5097 on 73 listings, alejandro 954-231-2133 on 57; 12 listings deliberately untouched) — a transferred call now rings those numbers.
+- **Legacy rows:** calls logged before the change carry the note "FCHB property — routed directly to voicemail…", and `lib/callSummary.js` still reads that note so those rows keep showing "Message sent to FCHB". New calls never write that note.
 
 ### Recordings: emailed as attachments + saved into Airtable (rewritten 2026-11-09)
 - **CONFIRMED FIXED 2026-11-09 (live test):** after the `record-from-answer-dual` change, a 163s transferred call produced a 42.5s stereo MP3 (64 kbps) in the MP3 field, plus `Second_Leg_Recording_URL`, `Call_Duration_Sec` = 163, and the voicemail landed in `Voicemail_File`.
 - **ROOT CAUSE found 2026-11-09:** the `<Dial record=…>` value was `record-from-answer-dual-channel`, which is **not a valid Twilio value** (valid: `record-from-answer`, `record-from-ringing`, `record-from-answer-dual`, `record-from-ringing-dual`). Twilio ignored it, so **calls with sellers were never recorded** (that's why no CALL LOG row ever had `Second_Leg_Recording_URL`). Now `record-from-answer-dual`. If a recording is missing again, first check Twilio Console → Monitor → Recordings for a Dial-sourced recording before debugging Airtable.
 Twilio's `RecordingUrl` needs our Twilio login, so a bare link is useless to anyone else. Two destinations:
+- **Voicemail safety net (2026-11-11):** `/voicemail-done` fires even if Twilio's transcript callback never does; `markMessageRecorded` then, `VOICEMAIL_FALLBACK_DELAY_MS` (default 150 s) later, saves the audio to `Voicemail_File` if the transcript callback has not. The voicemail **email** itself still depends on the transcript callback (not built).
 - **Voicemails** (≤120s) are fetched server-side (`fetchRecordingAttachment`) and **attached** to the email as `voicemail.mp3`; the same bytes go into CALL LOG **`Voicemail_File`**.
 - **The call with the seller** (dual-channel, includes a seller-voicemail greeting + message) goes into CALL LOG **`MP3`** **and is always emailed** with the full MP3 attached: subject **"IVR - Completed Call Recording"**, to `snapflatfee2@gmail.com` (override with `CALL_RECORDING_EMAIL_TO`), body has property, caller, language and recorded length (`emailCompletedCallRecording`). Jorge's rule: "I must get recordings via email always." Email and Airtable are independent (one failing never blocks the other); recordings over 25 MB are not attached (the email points to Airtable); each recording is emailed once even if the webhook and the look-up both deliver it. (Recordings are ~64 kbps stereo ≈ 0.5 MB/min, so 25 MB ≈ 50 minutes.)
 - **Attachment fields are addressed by permanent Airtable field ID** (`AT_FIELDS` in server.js: `fldMMqmGHjQAR3Db4` = Voicemail_File, `fldhLW65JGGv27bId` = MP3). **Why:** on 2026-11-09 every voicemail upload failed with a 403 `INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND` because the code wrote `"Voicemail File"` (space) and the field is `Voicemail_File` (underscore). Field names can now be renamed freely in Airtable (the old "Call Recording File" was renamed to "MP3" that way).
@@ -268,7 +262,7 @@ Jorge could not tell calls apart in Airtable ("Voicemail Left" meant five differ
 ### Caller text — every caller, always (changed 2026-11-10)
 Jorge's decision: no more "press 1 / say text" consent prompt; **everyone who calls gets a courtesy SMS** after the call (`sendCallerSms` / `callerSmsBody`, called from `postCallSends`). The prompts now just say "We will also text you the seller's contact information in case we can't connect you now" (transfer paths) or "We will also send you a text" (universal fallback).
 - Matched property **and** the call was handed to the seller (`Seller_Notified` true): "Thanks for calling the Office of Jorge Zea (Broker). Ref: {address}. In case you couldn't connect with the Seller|Landlord: Phone: … Email: …. We are available to answer any questions, just text us back." + STOP line.
-- Matched property, never reached the seller (commission voicemail, hung up in a menu): same but **no seller contact info** — EXCEPT **FCHB** listings (2026-11-12, Jorge: "must provide contact info regardless"): the text adds "To reach the Seller directly: Phone: … Email: …" (Spanish: "Para comunicarse directamente con el vendedor: …") even though the caller only went to voicemail. Ask Jorge before extending that to other sellers.
+- Matched property, never reached the seller (commission voicemail, hung up in a menu): same but **no seller contact info**. (FCHB used to be an exception until 2026-11-16; it is not any more.) Ask Jorge before ever giving a never-reached seller's contact to the caller.
 - **Phone numbers people read** (lead-alert text, seller/voicemail/recording emails, seller contact in caller texts) go through `prettyPhone()` → `305-555-0301` (2026-11-12, Jorge). Display only: Airtable, Twilio and dialling keep `+1…`; international/anonymous values are shown as they came.
 - **Address in every text/email** goes through `tidyAddress()`: the Airtable `Address` column often already holds the whole address, so City/State/ZIP are added only for the parts not already in it (word-boundary check, so "Flamingo Rd" does not hide the state "FL"). Before 2026-11-12 it printed "…Orlando, FL 32836, Orlando FL 32836".
 - No property / no address / no match: "Hi, it appears you just called the Office of Jorge Zea (Broker) but we couldn't connect or get the property address. Feel free to text us back and tell us how we can assist you."
@@ -299,7 +293,7 @@ If a Realtor leaves a voicemail after the commission script → email goes to `s
 - **Spanish voicemails:** Twilio's built-in transcription is **English-only** (documented), so Spanish messages produce nonsense transcripts. Emails and the Airtable `Transcript` now say so ("Mensaje en español… listen to the recording"). A real Spanish transcript would need a different service (e.g. Twilio Voice Intelligence with an es-US service, or another speech-to-text) — not built; ask Jorge.
 
 ### Call_Disposition may only use these 6 values
-`Transferred to Seller`, `SMS Sent`, `Voicemail Left`, `Hung Up`, `No Match Found`, `Transferred to Voicemail`. Airtable **rejects any other value** (and the code swallows the error, so the whole update is lost). Until 2026-11-09 the code wrote `Completed`, `Inactive Property`, `FCHB - Voicemail` and `Seller Unavailable (…)` — those updates silently failed. Now: seller never took the call → `Transferred to Voicemail` + a line in Notes (`appendNote`); inactive/unmatched → `No Match Found` + Notes; FCHB → `Voicemail Left` + Notes; real call length → `Call_Duration_Sec` (from `/call-status`). If you add a disposition, add the dropdown option in Airtable first.
+`Transferred to Seller`, `SMS Sent`, `Voicemail Left`, `Hung Up`, `No Match Found`, `Transferred to Voicemail`. Airtable **rejects any other value** (and the code swallows the error, so the whole update is lost). Until 2026-11-09 the code wrote `Completed`, `Inactive Property`, `FCHB - Voicemail` and `Seller Unavailable (…)` — those updates silently failed. Now: seller never took the call → `Transferred to Voicemail` + a line in Notes (`appendNote`); inactive/unmatched → `No Match Found` + Notes; (FCHB used to be `Voicemail Left` + Notes — removed 2026-11-16); real call length → `Call_Duration_Sec` (from `/call-status`). If you add a disposition, add the dropdown option in Airtable first.
 
 ### `Listing_Link` fallback
 Airtable's JS client sometimes silently drops linked record writes on create. `postCallSends` checks `Listing_Link` first, then falls back to searching ALL LISTINGS by `Prop_ID`. Railway logs will show: `postCallSends: Listing_Link was empty — used Prop_ID fallback (ONBRD_XXXXX)`.
@@ -326,7 +320,6 @@ Business hours: **7AM–9PM Eastern**, every day. Handled by `isWithinBusinessHo
 | Voicemail — commission branch | snapflatfee2@gmail.com ONLY |
 | After hours — matched | Seller's email |
 | After hours — no match | snapflatfee2@gmail.com |
-| FCHB property | kevin@ or alejandro@floridacashhomebuyers.com |
 
 All from `noreply@snapflatfee.com`, reply-to `snapflatfee@gmail.com`.
 
