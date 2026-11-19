@@ -1,7 +1,7 @@
 // Run: node --test test/        (no network, no Airtable)
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { summarizeCall, changedFields, OUTCOME } = require('../lib/callSummary');
+const { summarizeCall, changedFields, OUTCOME, isStopText, isStartText } = require('../lib/callSummary');
 
 const ATT = [{ filename: 'x.mp3' }];
 const KP  = 'Caller consented to recording by continuing on the line (FL two-party notice at greeting).';
@@ -100,6 +100,25 @@ test('auto-reply: the text that carried the address does not re-open it, but a l
 test('no auto-reply marker: behaviour is unchanged (message + no address still Needs you)', () => {
   const s = summarizeCall({ Property_Address: 'No Address', Call_Disposition: 'Voicemail Left', Voicemail_URL: 'u', Notes: 'Reason: no_address.' });
   assert.equal(s.Attention, 'Needs you');
+});
+
+test('STOP: recognised like Twilio does (the whole text is the keyword), START brings them back', () => {
+  for (const t of ['STOP', 'stop', 'Stop.', '  Unsubscribe ', 'CANCEL', 'end', 'Quit', 'stopall', 'opt out']) assert.equal(isStopText(t), true, t);
+  for (const t of ['please stop by tomorrow', 'stop calling me about 500 Palm', 'I want to stop', '', null, '500 Palm Ln']) assert.equal(isStopText(t), false, String(t));
+  for (const t of ['START', 'unstop', 'Yes', 'yes.']) assert.equal(isStartText(t), true, t);
+  assert.equal(isStartText('yes please call me'), false);
+});
+
+test('a STOP reply is not "Needs you" (nothing can be sent to them) and says so; a real reply after it still is', () => {
+  const base = { Real_Address: 'A', Prop_ID: 'P', Call_Disposition: 'No Match Found', Notes: '[SMS REPLY 11/18/2026, 9:25:08 AM]: Did it flood?\n[SMS REPLY 11/18/2026, 9:34:51 AM]: Stop' };
+  const s = summarizeCall(base);
+  assert.equal(s.Attention, 'None'); assert.match(s['What happened'], /opted out of texts \(STOP\)/); assert.doesNotMatch(s['What happened'], /texted back/);
+  assert.equal(summarizeCall({ ...base, Notes: base.Notes + '\n[SMS REPLY 11/18/2026, 9:40:00 AM]: call me please' }).Attention, 'Needs you');
+});
+
+test('a call where no text was sent because they had opted out says so', () => {
+  const s = summarizeCall({ Property_Address: 'No Address', Call_Disposition: 'Hung Up', Notes: 'x\n[NO TEXT SENT 11/19/2026, 4:16:00 PM]: this caller replied STOP earlier, so no text was sent.' });
+  assert.match(s['What happened'], /Caller has opted out of texts \(STOP\), so none was sent\./); assert.equal(s['Caller texted'], false); assert.equal(s.Attention, 'None');
 });
 
 test('changedFields writes only what is different (a re-run writes nothing)', () => {

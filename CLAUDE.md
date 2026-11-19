@@ -276,6 +276,15 @@ Jorge's decision: no more "press 1 / say text" consent prompt; **everyone who ca
 - `/flag-sms` and `/fallback-sms-choice` are kept only so a call already mid-flow during the deploy doesn't 404.
 - Seller "Lead Call Received" emails/SMS are unchanged.
 
+### STOP — opted-out numbers are never texted (added 2026-11-19)
+Found with 941-564-9874: replied "Stop" on 11/18, then called 6 more times; each time we **tried** to text, Twilio refused (error 21610, the number is on its STOP list), so nothing was delivered and `SMS_Sent`/"Caller texted" correctly stayed off — but the attempt showed in Twilio and in the Messages tab as an hourglass, which looked like a sent text.
+- `sendCallerSms` now calls `callerOptedOut(to)` first: it reads the number's `[SMS REPLY …]: text` lines in CALL LOG Notes oldest→newest; a text that is just STOP/STOPALL/UNSUBSCRIBE/CANCEL/END/QUIT/REVOKE/OPTOUT (`isStopText`, Twilio's default keywords, whole message) opts out, START/UNSTOP/YES/SUBSCRIBE (`isStartText`) opts back in; last one wins. Opted out → no send, Notes gets `[NO TEXT SENT time]: this caller replied STOP earlier, so no text was sent.`
+- Belt and braces: if Twilio still returns 21610 (a STOP we never logged), the same note is written. If the Airtable look-up itself fails we send anyway (Twilio blocks it regardless).
+- Applies to every caller text: the post-call text, the hang-up follow-up, and the auto-reply. An opted-out caller who texts an address is **not** auto-answered; the call is flagged for a person.
+- `lib/callSummary.js`: a STOP reply no longer makes a call "Needs you" (nothing can be sent back); the sentence says "Caller has opted out of texts (STOP), so none was sent." A real message after the STOP still flags.
+- Not covered: seller lead-alert texts to a seller who replied STOP (those numbers are not in CALL LOG; Twilio blocks them and `notifySeller` logs the error).
+- Dashboard Messages tab: outgoing messages with status failed/undelivered now show a red "✕ not delivered" instead of ⏳.
+
 ### Auto-reply with the seller's contact for unmatched callers (added 2026-11-19, Jorge)
 Many "address not found" callers leave a voicemail or text back **with** the address. Instead of flagging every one as *Needs you*, `tryAutoReply(logId, text, via)` (server.js, next to `sendCallerSms`) looks for a listed property in that text and, if found, texts the caller the seller's contact by itself.
 - **Triggers:** `/voicemail-transcribed` (transcript of an unmatched call; not commission/seller-unavailable branches, **not Spanish** because the English-only transcript is unreliable) and `/sms-inbound` (the caller's text reply on their latest CALL LOG row).

@@ -116,7 +116,7 @@ const twilioClient  = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_
 const VoiceResponse = twilio.twiml.VoiceResponse;
 const base          = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);
 const claude        = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const { summarizeCall, changedFields } = require('./lib/callSummary');
+const { summarizeCall, changedFields, isStopText, isStartText } = require('./lib/callSummary');
 
 // ─── Email via Resend (Railway blocks SMTP port 587 — use HTTP API instead) ──
 // Sign up free at resend.com, get API key, add RESEND_API_KEY to Railway env vars
@@ -463,10 +463,45 @@ function callerSmsBody({ lang, listing, fullAddr, transferred, autoReply = false
     ` We are available to answer any questions, just text us back.${EN_TAIL}`;
 }
 
-async function sendCallerSms({ to, lang, listing, fullAddr, transferred, autoReply = false }) {
+// ─── TEXT OPT-OUTS (STOP) ────────────────────────────────────────────────────
+// Twilio itself refuses to text a number that replied STOP (error 21610), but until 2026-11-19 we still tried, so the
+// attempt showed up as a failed text in Twilio / the Messages tab while CALL LOG correctly said "not texted".
+// Now we check first: every reply is already logged in CALL LOG Notes as "[SMS REPLY …]: text", so the number's
+// replies, oldest to newest, tell us whether the last word was STOP (opted out) or START/UNSTOP/YES (back in).
+async function callerOptedOut(to) {
+  try {
+    const rows = await base('CALL LOG').select({
+      filterByFormula: `AND({Caller_Number} = ${airtableStr(to)}, FIND("[SMS REPLY", {Notes}))`,
+      sort: [{ field: 'Call_Date', direction: 'asc' }], fields: ['Notes'], maxRecords: 100,
+    }).firstPage();
+    let out = false;
+    for (const r of rows) for (const line of String(r.get('Notes') || '').split('\n')) {
+      const m = /^\[SMS REPLY [^\]]+\]:\s*(.*)$/.exec(line.trim());
+      if (!m) continue;
+      if (isStopText(m[1])) out = true; else if (isStartText(m[1])) out = false;
+    }
+    return out;
+  } catch (e) {
+    console.error('opt-out check failed (sending anyway; Twilio blocks opted-out numbers itself):', e.message || e);
+    return false;
+  }
+}
+async function noteOptOut(logId, to) {
+  console.log(`Caller SMS not sent: ${to} has opted out (STOP)`);
+  if (!logId) return;
+  try {
+    const rec = await base('CALL LOG').find(logId);
+    const cur = rec.get('Notes') || '';
+    if (cur.includes('[NO TEXT SENT')) return;
+    await base('CALL LOG').update(logId, { Notes: `${cur ? `${cur}\n` : ''}[NO TEXT SENT ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })}]: this caller replied STOP earlier, so no text was sent.` });
+  } catch (e) { console.error('noteOptOut failed:', e.message || e); }
+}
+
+async function sendCallerSms({ to, lang, listing, fullAddr, transferred, autoReply = false, logId = '' }) {
   if (!callerSmsOn()) return false;
   if (!/^\+\d{10,15}$/.test(String(to || ''))) return false;            // blocked / anonymous callers
   if (to === process.env.TWILIO_PHONE_NUMBER) return false;
+  if (await callerOptedOut(to)) { await noteOptOut(logId, to); return false; }
   const key = `${to}|${listing ? listing.id : 'none'}`;
   const last = recentCallerSms.get(key);
   if (last && Date.now() - last < CALLER_SMS_REPEAT_MS) { console.log(`Caller SMS skipped (already texted ${to} in the last 30 min)`); return false; }
@@ -478,6 +513,7 @@ async function sendCallerSms({ to, lang, listing, fullAddr, transferred, autoRep
   } catch (e) {
     console.error('Caller SMS error:', e.message);
     recentCallerSms.delete(key);   // let a later attempt retry
+    if (e.code === 21610) await noteOptOut(logId, to);   // Twilio's own STOP list says no (e.g. the STOP was never logged here)
     return false;
   }
 }
@@ -517,7 +553,7 @@ async function tryAutoReply(logId, text, via) {
     // call ends. If that has not happened yet, skip it: the caller gets just this text. Undone below if the send fails.
     if (!postCallSentLogIds.has(logId) && !f.SMS_Sent) { postCallSentLogIds.add(logId); suppressedPostCall = true; }
 
-    const sent = await sendCallerSms({ to, lang, listing, fullAddr, transferred: true, autoReply: true });
+    const sent = await sendCallerSms({ to, lang, listing, fullAddr, transferred: true, autoReply: true, logId });
     if (!sent) { if (suppressedPostCall) postCallSentLogIds.delete(logId); return false; }
 
     const when = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
@@ -592,7 +628,7 @@ async function postCallSends(logId, { callerOnly = false } = {}) {
 
     // SMS to the caller — always (see CALLER TEXT above)
     if (callerNumber) {
-      const sent = await sendCallerSms({ to: callerNumber, lang, listing, fullAddr, transferred: !!logRecord.get('Seller_Notified') });
+      const sent = await sendCallerSms({ to: callerNumber, lang, listing, fullAddr, transferred: !!logRecord.get('Seller_Notified'), logId });
       if (sent) await base('CALL LOG').update(logId, { SMS_Sent: true }).catch(console.error);
     }
 
