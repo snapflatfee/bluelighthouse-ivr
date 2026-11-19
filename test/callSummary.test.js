@@ -79,6 +79,27 @@ test('a text reply re-opens a call until it is marked Handled', () => {
   assert.equal(summarizeCall({ ...base, Handled: true }).Attention, 'None');
 });
 
+test('auto-reply: address found in the voicemail, seller contact texted → nothing for Jorge (2026-11-19)', () => {
+  const s = summarizeCall({ Caller_Type: 'Buyer', Real_Address: '5 Oak St, Orlando, FL 32801', Prop_ID: 'P', Voicemail_URL: 'u', Call_Disposition: 'Voicemail Left', SMS_Sent: true,
+    Notes: `${KP}\n[AUTO REPLY 11/19/2026, 9:00:00 AM]: address found in the voicemail; seller contact texted.` });
+  assert.equal(s.Attention, 'None'); assert.equal(s['Action needed'], ''); assert.equal(s.Outcome, OUTCOME.MESSAGE);
+  assert.match(s['What happened'], /about 5 Oak St, Orlando\. Gave us the property address, so the seller's contact was texted to the caller automatically\. Caller texted\./);
+});
+
+test('auto-reply: the text that carried the address does not re-open it, but a later reply does', () => {
+  const first = `${KP}\n[SMS REPLY 11/19/2026, 9:00:00 AM]: 5 Oak St Orlando\n[AUTO REPLY 11/19/2026, 9:00:02 AM]: address found in the text reply; seller contact texted.`;
+  const row = { Real_Address: 'A', Prop_ID: 'P', Call_Disposition: 'No Match Found', SMS_Sent: true, Notes: first };
+  assert.equal(summarizeCall(row).Attention, 'None');
+  const later = summarizeCall({ ...row, Notes: `${first}\n[SMS REPLY 11/19/2026, 9:05:00 AM]: can you also send the HOA?` });
+  assert.equal(later.Attention, 'Needs you'); assert.match(later['Action needed'], /texted back/);
+  assert.equal(summarizeCall({ ...row, Handled: true, Notes: `${first}\n[SMS REPLY 11/19/2026, 9:05:00 AM]: thanks` }).Attention, 'None');
+});
+
+test('no auto-reply marker: behaviour is unchanged (message + no address still Needs you)', () => {
+  const s = summarizeCall({ Property_Address: 'No Address', Call_Disposition: 'Voicemail Left', Voicemail_URL: 'u', Notes: 'Reason: no_address.' });
+  assert.equal(s.Attention, 'Needs you');
+});
+
 test('changedFields writes only what is different (a re-run writes nothing)', () => {
   const row = { Call_Disposition: 'Voicemail Left', Voicemail_File: ATT };
   const s = summarizeCall(row);

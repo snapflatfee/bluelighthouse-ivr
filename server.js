@@ -94,11 +94,15 @@ app.post('/sms-inbound', async (req, res) => {
 
     if (records.length > 0) {
       const existing = records[0].get('Notes') || '';
+      const wasHandled = !!records[0].get('Handled');
       await base('CALL LOG').update(records[0].id, {
         Notes: existing + `\n[SMS REPLY ${new Date().toLocaleString('en-US',{timeZone:'America/New_York'})}]: ${body}`,
         Handled: false, 'Handled at': null,     // a new reply re-opens it
       }).catch(console.error);
-      await updateCallSummary(records[0].id);
+      // The reply may carry the property address for a call we could not match: then text the seller's contact
+      // ourselves and leave it un-flagged (see tryAutoReply). Not when a person already handled that call.
+      const auto = wasHandled ? false : await tryAutoReply(records[0].id, body, "caller's text reply");
+      if (!auto) await updateCallSummary(records[0].id);
     }
   } catch (err) {
     console.error('SMS inbound log error:', err);
@@ -425,9 +429,19 @@ function tidyAddress(address, ...extras) {
   return [a, missing.join(' ')].filter(Boolean).join(', ');
 }
 
-function callerSmsBody({ lang, listing, fullAddr, transferred }) {
+function callerSmsBody({ lang, listing, fullAddr, transferred, autoReply = false }) {
   const EN_TAIL = '\n\nMsg & data rates may apply. Reply STOP to opt out.';
   const ES_TAIL = '\n\nTarifas pueden aplicar. Responda STOP para cancelar.';
+  if (listing && autoReply) {
+    // The caller gave us the property address (voicemail or text) and it matched a listing: send the seller's contact.
+    const isRent = /rent|lease|alquil/i.test((listing.get('Type') || '').toString());
+    const ph = prettyPhone((listing.get('Phone') || '').toString().trim());
+    const em = (listing.get('Email') || '').toString().trim();
+    const contact = [ph && `Phone: ${ph}`, em && `Email: ${em}`].filter(Boolean).join('. ');
+    const en = `Thanks for your message about ${fullAddr}. ${isRent ? 'Landlord' : 'Seller'} contact: ${contact}. We are available to answer any questions, just text us back.${EN_TAIL}`;
+    const es = `Gracias por su mensaje sobre ${fullAddr}. Contacto de ${isRent ? 'el propietario' : 'el vendedor'}: ${contact}. Estamos a su disposicion para cualquier pregunta, solo responda a este texto.${ES_TAIL}`;
+    return lang === 'es' ? es : lang === 'en' ? en : `${en}\n\n${es}`;
+  }
   if (!listing) {
     const en = `Hi, it appears you just called the Office of Jorge Zea (Broker) but we couldn't connect or get the property address. Feel free to text us back and tell us how we can assist you.`;
     const es = `Hola, parece que llamo a la oficina de Jorge Zea (Corredor) pero no pudimos comunicarnos ni obtener la direccion de la propiedad. Envienos un texto y digenos como podemos ayudarle.`;
@@ -449,7 +463,7 @@ function callerSmsBody({ lang, listing, fullAddr, transferred }) {
     ` We are available to answer any questions, just text us back.${EN_TAIL}`;
 }
 
-async function sendCallerSms({ to, lang, listing, fullAddr, transferred }) {
+async function sendCallerSms({ to, lang, listing, fullAddr, transferred, autoReply = false }) {
   if (!callerSmsOn()) return false;
   if (!/^\+\d{10,15}$/.test(String(to || ''))) return false;            // blocked / anonymous callers
   if (to === process.env.TWILIO_PHONE_NUMBER) return false;
@@ -459,13 +473,66 @@ async function sendCallerSms({ to, lang, listing, fullAddr, transferred }) {
   recentCallerSms.set(key, Date.now());
   if (recentCallerSms.size > 1000) recentCallerSms.delete(recentCallerSms.keys().next().value);
   try {
-    await twilioClient.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to, body: callerSmsBody({ lang, listing, fullAddr, transferred }) });
+    await twilioClient.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to, body: callerSmsBody({ lang, listing, fullAddr, transferred, autoReply }) });
     return true;
   } catch (e) {
     console.error('Caller SMS error:', e.message);
     recentCallerSms.delete(key);   // let a later attempt retry
     return false;
   }
+}
+
+// ─── AUTO-REPLY WITH THE SELLER'S CONTACT (added 2026-11-19, Jorge) ───────────
+// A caller whose property was not found often leaves a voicemail or texts back WITH the address. If that text matches an
+// Active/Pending listing (same strict rules as a live call: house number, direction…) and the listing has a phone or
+// email, text the caller the seller's contact right away and do NOT flag the call for a person. Everything else stays
+// flagged: no address, address not found / not active, no contact on file, a failed send, or any reply AFTER our text.
+// Records "[AUTO REPLY …]" in Notes (that line is what lib/callSummary.js reads) and links the row to the listing.
+// AUTO_REPLY=off in Railway turns it off; AUTO_REPLY_WINDOW_HOURS (default 72) is how old the call may be.
+const autoReplyOn = () => (process.env.AUTO_REPLY || 'on').toLowerCase() !== 'off';
+const autoReplyBusy = new Set();
+async function tryAutoReply(logId, text, via) {
+  if (!autoReplyOn() || !logId || !String(text || '').trim() || autoReplyBusy.has(logId)) return false;
+  autoReplyBusy.add(logId);
+  let suppressedPostCall = false;
+  try {
+    const row = await base('CALL LOG').find(logId);
+    const f = row.fields || {};
+    if (f.Real_Address || f.Prop_ID || (f.Listing_Link || []).length) return false;             // already matched: normal flow
+    if (String(f.Notes || '').includes('[AUTO REPLY') || f.Handled) return false;               // done already / a person took it
+    const to = String(f.Caller_Number || '');
+    const hours = parseInt(process.env.AUTO_REPLY_WINDOW_HOURS, 10) || 72;
+    if (f.Call_Date && Date.now() - new Date(f.Call_Date).getTime() > hours * 3600 * 1000) return false;
+    if (!/^\+\d{10,15}$/.test(to) || to === process.env.TWILIO_PHONE_NUMBER) return false;
+
+    const listings = (await fetchListings()).filter(isLive);
+    const match = findMatchInText(listings, text);
+    if (!match || !(match.phone || match.email)) return false;                                   // no address / not found / no contact
+
+    const listing = await base('ALL LISTINGS').find(match.id);
+    const fullAddr = tidyAddress(listing.get('Address') || listing.get('Street Address') || '', listing.get('City'), listing.get('State'), listing.get('Zip code'));
+    const lang = f.Language === 'Spanish' ? 'es' : f.Language === 'English' ? 'en' : 'both';
+
+    // Our "couldn't get the address" text (and the seller notice) are sent by postCallSends a few seconds after the
+    // call ends. If that has not happened yet, skip it: the caller gets just this text. Undone below if the send fails.
+    if (!postCallSentLogIds.has(logId) && !f.SMS_Sent) { postCallSentLogIds.add(logId); suppressedPostCall = true; }
+
+    const sent = await sendCallerSms({ to, lang, listing, fullAddr, transferred: true, autoReply: true });
+    if (!sent) { if (suppressedPostCall) postCallSentLogIds.delete(logId); return false; }
+
+    const when = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+    await base('CALL LOG').update(logId, {
+      Listing_Link: [match.id], Real_Address: match.fullAddress, Prop_ID: match.prop_id, SMS_Sent: true,
+      Notes: `${f.Notes ? `${f.Notes}\n` : ''}[AUTO REPLY ${when}]: address found in the ${via}; texted the seller's contact (${fullAddr}) to the caller.`,
+    }).catch((e) => console.error('auto-reply: could not update CALL LOG after the text was sent:', e.message || e));
+    await updateCallSummary(logId);
+    console.log(`auto-reply: ${logId} matched ${match.fullAddress} from the ${via}; seller contact texted to ${to}`);
+    return true;
+  } catch (e) {
+    console.error('auto-reply failed (call stays flagged):', e.message || e);
+    if (suppressedPostCall) postCallSentLogIds.delete(logId);
+    return false;
+  } finally { autoReplyBusy.delete(logId); }
 }
 
 // postCallSends(logId, { callerOnly }) — callerOnly skips the seller notification (used for the delayed
@@ -1629,6 +1696,11 @@ app.post('/voicemail-transcribed', async (req, res) => {
   const recordingLine = attachments
     ? `<p><b>Recording:</b> attached to this email (voicemail.mp3)</p>`
     : `<p><b>Recording:</b> <a href="${recordingUrl}">Listen</a> (requires Twilio Console login — attachment failed to fetch, see Railway logs)</p>`;
+  // A message from a caller we could not match: if the transcript names a listed property, text the seller's contact
+  // now (tryAutoReply) and send the office the ordinary voicemail email instead of a "needs attention" one.
+  const autoHandled = (!isCommission && req.query.branch !== 'seller' && logId && transcript && !spanishNote)
+    ? await tryAutoReply(logId, transcript, 'voicemail transcript') : false;
+
   // Who called (number, carrier name, property) — from the CALL LOG row, so every voicemail email says who it is.
   let lf = {};
   if (logId) { try { lf = (await base('CALL LOG').find(logId)).fields || {}; } catch (e) { console.error('voicemail email: could not read CALL LOG:', e.message); } }
@@ -1676,13 +1748,16 @@ app.post('/voicemail-transcribed', async (req, res) => {
       }).catch(console.error);
     }
   } else {
-    emailedTo = isAttention ? 'Office (needs attention)' : 'Office';
+    const needsAttention = isAttention && !autoHandled;
+    emailedTo = needsAttention ? 'Office (needs attention)' : 'Office';
     // Normal flow
     await sendEmail({
       from: process.env.EMAIL_FROM,
-      to: isAttention ? 'snapflatfee2@gmail.com' : process.env.EMAIL_TO,
-      subject: isAttention ? 'IVR — Voicemail needs attention' : `📞 New Voicemail — ${ts}`,
-      html: html('New Voicemail — Blue Lighthouse Realty', `<p><b>Language:</b> ${lang === 'es' ? 'Spanish' : 'English'}</p><p><b>Call SID:</b> ${callSid}</p>`),
+      to: needsAttention ? 'snapflatfee2@gmail.com' : process.env.EMAIL_TO,
+      subject: needsAttention ? 'IVR — Voicemail needs attention' : autoHandled ? `📞 New Voicemail (seller contact auto-texted) — ${ts}` : `📞 New Voicemail — ${ts}`,
+      html: html('New Voicemail — Blue Lighthouse Realty',
+        `<p><b>Language:</b> ${lang === 'es' ? 'Spanish' : 'English'}</p><p><b>Call SID:</b> ${callSid}</p>`
+        + (autoHandled ? `<p style="background:#eef7ee;padding:10px 12px;border-left:4px solid #2e7d32;"><b>Handled automatically:</b> the transcript names a listed property, so the caller was texted the seller's contact. Nothing needed unless they reply.</p>` : '')),
       attachments,
     }).catch(console.error);
   }

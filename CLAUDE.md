@@ -64,6 +64,8 @@ bluelighthouse-ivr/
 | `SELLER_CALLER_ID` *(optional)* | `caller` (default: seller sees the original caller's number) or `twilio` (seller sees `TWILIO_PHONE_NUMBER`) |
 | `RECORDING_BACKFILL_DELAYS_MS` *(optional)* | Comma-separated delays for the recording look-up after the seller's leg ends (default `20000,90000`) |
 | `CALLER_SMS` *(optional)* | `off` stops the courtesy text to callers (default on) |
+| `AUTO_REPLY` *(optional)* | `off` stops the automatic "seller contact" text for callers whose voicemail/text names a listed property (default on) |
+| `AUTO_REPLY_WINDOW_HOURS` *(optional)* | How old an unmatched call may be and still be auto-answered by a text reply (default 72) |
 | `HANGUP_FOLLOWUP_DELAY_MS` *(optional)* | Wait before texting/logging a caller who hung up before any log row existed (default 90000) |
 | `CALL_RECORDING_EMAIL_TO` *(optional)* | Where "IVR - Completed Call Recording" emails go (default `snapflatfee2@gmail.com`) |
 | `HOLD_MUSIC_URL` *(optional)* | Public URL of a short (~3–5s) MP3 played after "One moment while I look that up" while the Airtable lookup runs. Unset = spoken line only |
@@ -273,6 +275,16 @@ Jorge's decision: no more "press 1 / say text" consent prompt; **everyone who ca
 - Compliance note raised with Jorge: the Twilio A2P campaign (C19Z367) was registered with the in-call opt-in; the texts are replies to a call the person placed, but Jorge should make sure the campaign's consent/opt-in description still matches, and watch for carrier filtering.
 - `/flag-sms` and `/fallback-sms-choice` are kept only so a call already mid-flow during the deploy doesn't 404.
 - Seller "Lead Call Received" emails/SMS are unchanged.
+
+### Auto-reply with the seller's contact for unmatched callers (added 2026-11-19, Jorge)
+Many "address not found" callers leave a voicemail or text back **with** the address. Instead of flagging every one as *Needs you*, `tryAutoReply(logId, text, via)` (server.js, next to `sendCallerSms`) looks for a listed property in that text and, if found, texts the caller the seller's contact by itself.
+- **Triggers:** `/voicemail-transcribed` (transcript of an unmatched call; not commission/seller-unavailable branches, **not Spanish** because the English-only transcript is unreliable) and `/sms-inbound` (the caller's text reply on their latest CALL LOG row).
+- **Sends only if all hold:** the row has no listing yet · not already `[AUTO REPLY` in Notes · not `Handled` · call ≤ `AUTO_REPLY_WINDOW_HOURS` (72) old · caller number is a real `+` number · `findMatchInText()` finds an **Active/Pending** listing (same strict house-number/direction rules as a live call) · that listing has a Phone or Email · the SMS goes out (`sendCallerSms({autoReply:true})`, so the 30-min repeat guard and `CALLER_SMS=off` still apply).
+- **Text:** "Thanks for your message about {address}. Seller|Landlord contact: Phone: xxx-xxx-xxxx. Email: …. We are available to answer any questions, just text us back." + STOP line (Spanish for Spanish rows, both if the language is unknown). ASCII only.
+- **On success:** the row gets `Listing_Link`, `Real_Address`, `Prop_ID`, `SMS_Sent`, and a Notes line `[AUTO REPLY time]: address found in the … ; texted the seller's contact (…) to the caller.` `lib/callSummary.js` reads that marker: Outcome stays "Message left with us" but **Attention = None**, no Action needed, and the sentence says the contact was texted automatically. The office voicemail email becomes "📞 New Voicemail (seller contact auto-texted)" to `EMAIL_TO` with a green "Handled automatically" line instead of the "needs attention" email to snapflatfee2.
+- **Stays flagged (Needs you) when:** no address in the message, address not found / not Active-Pending, no contact on the listing, Spanish voicemail, SMS failed, auto-reply off, or **any text reply that arrives AFTER the auto text** (the reply that carried the address is logged before the marker, so it does not count).
+- **Deliberately not done:** the seller is **not** notified (no lead-alert email/SMS) for an auto-answered call; if the call had not yet gone through `postCallSends`, the generic "couldn't get the address" text and seller notice are skipped (`postCallSentLogIds` is pre-set) so the caller gets exactly one text. Jorge explicitly authorized giving the seller's contact here — the earlier rule "ask before giving a never-reached seller's contact" still applies to every other path.
+- Tests: 16 harness checks (voicemail + text paths, every "stays flagged" case, Spanish/rental/both-language wording, repeat guard, kill switch, Twilio failure) plus 3 unit tests in `test/callSummary.test.js`; mutation-checked.
 
 Seller "Lead Call Received" email + SMS intentionally fire for every matched call that ends (including commission voicemails, inactive listings, hang-ups) — decided to keep.
 
