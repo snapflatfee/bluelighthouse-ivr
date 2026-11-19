@@ -84,6 +84,8 @@ test('auto-reply: address found in the voicemail, seller contact texted → noth
     Notes: `${KP}\n[AUTO REPLY 11/19/2026, 9:00:00 AM]: address found in the voicemail; seller contact texted.` });
   assert.equal(s.Attention, 'None'); assert.equal(s['Action needed'], ''); assert.equal(s.Outcome, OUTCOME.MESSAGE);
   assert.match(s['What happened'], /about 5 Oak St, Orlando\. Gave us the property address, so the seller's contact was texted to the caller automatically\. Caller texted\./);
+  const alerted = summarizeCall({ Real_Address: 'A', Prop_ID: 'P', Voicemail_URL: 'u', SMS_Sent: true, 'Seller emailed': true, Notes: '[AUTO REPLY 11/19/2026, 9:00:00 AM]: x' });
+  assert.match(alerted['What happened'], /texted to the caller automatically, and the seller was alerted\. Caller texted\./);
 });
 
 test('auto-reply: the text that carried the address does not re-open it, but a later reply does', () => {

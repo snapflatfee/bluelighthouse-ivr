@@ -485,7 +485,7 @@ async function sendCallerSms({ to, lang, listing, fullAddr, transferred, autoRep
 // ─── AUTO-REPLY WITH THE SELLER'S CONTACT (added 2026-11-19, Jorge) ───────────
 // A caller whose property was not found often leaves a voicemail or texts back WITH the address. If that text matches an
 // Active/Pending listing (same strict rules as a live call: house number, direction…) and the listing has a phone or
-// email, text the caller the seller's contact right away and do NOT flag the call for a person. Everything else stays
+// email, text the caller the seller's contact right away, alert the seller (caller's number) and do NOT flag the call for a person. Everything else stays
 // flagged: no address, address not found / not active, no contact on file, a failed send, or any reply AFTER our text.
 // Records "[AUTO REPLY …]" in Notes (that line is what lib/callSummary.js reads) and links the row to the listing.
 // AUTO_REPLY=off in Railway turns it off; AUTO_REPLY_WINDOW_HOURS (default 72) is how old the call may be.
@@ -525,6 +525,14 @@ async function tryAutoReply(logId, text, via) {
       Listing_Link: [match.id], Real_Address: match.fullAddress, Prop_ID: match.prop_id, SMS_Sent: true,
       Notes: `${f.Notes ? `${f.Notes}\n` : ''}[AUTO REPLY ${when}]: address found in the ${via}; texted the seller's contact (${fullAddr}) to the caller.`,
     }).catch((e) => console.error('auto-reply: could not update CALL LOG after the text was sent:', e.message || e));
+    // The seller is alerted exactly as for any other matched call (email always; text only with SMS_Recording_Consent),
+    // with the caller's number and carrier name, so they know someone has their contact and may call or text.
+    try {
+      const alert = await notifySeller({ record: listing, callerNumber: to, callerName: f.Caller_Name || '', callerType: f.Caller_Type || 'Buyer',
+        address: listing.get('Address') || listing.get('Street Address') || '', city: listing.get('City') || '' });
+      const upd = { ...(alert.sms ? { Seller_SMS_Sent: true } : {}), ...(alert.email ? { 'Seller emailed': true } : {}) };
+      if (Object.keys(upd).length) await base('CALL LOG').update(logId, upd);
+    } catch (e) { console.error('auto-reply: seller alert failed:', e.message || e); }
     await updateCallSummary(logId);
     console.log(`auto-reply: ${logId} matched ${match.fullAddress} from the ${via}; seller contact texted to ${to}`);
     return true;
