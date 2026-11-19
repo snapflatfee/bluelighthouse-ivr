@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { summarizeCall, changedFields, OUTCOME, isStopText, isStartText } = require('../lib/callSummary');
+const { smsErrorText } = require('../lib/smsErrors');
 
 const ATT = [{ filename: 'x.mp3' }];
 const KP  = 'Caller consented to recording by continuing on the line (FL two-party notice at greeting).';
@@ -119,6 +120,32 @@ test('a STOP reply is not "Needs you" (nothing can be sent to them) and says so;
 test('a call where no text was sent because they had opted out says so', () => {
   const s = summarizeCall({ Property_Address: 'No Address', Call_Disposition: 'Hung Up', Notes: 'x\n[NO TEXT SENT 11/19/2026, 4:16:00 PM]: this caller replied STOP earlier, so no text was sent.' });
   assert.match(s['What happened'], /Caller has opted out of texts \(STOP\), so none was sent\./); assert.equal(s['Caller texted'], false); assert.equal(s.Attention, 'None');
+});
+
+test('smsErrorText: plain words for the codes we meet, something readable for the rest', () => {
+  assert.equal(smsErrorText(30006), 'landline or unreachable carrier'); assert.equal(smsErrorText('21610'), 'the person replied STOP');
+  assert.equal(smsErrorText('30007'), 'filtered by the carrier'); assert.equal(smsErrorText(99999), 'Twilio error 99999');
+  assert.equal(smsErrorText(''), 'reason not given'); assert.equal(smsErrorText(null), 'reason not given');
+});
+
+test('a caller text that never arrived: "Caller texted" goes off even if the old box is still ticked, and the sentence says why', () => {
+  const s = summarizeCall({ Property_Address: 'No Address', Call_Disposition: 'Hung Up', SMS_Sent: true,
+    Notes: '[TEXT NOT DELIVERED 11/19/2026, 5:11:00 PM]: (caller) landline or unreachable carrier (Twilio error 30006) - the text to the caller (480-631-2856) did not arrive. SM1' });
+  assert.equal(s['Caller texted'], false); assert.match(s['What happened'], /Text to the caller was not delivered \(landline or unreachable carrier\)\./); assert.doesNotMatch(s['What happened'], /Caller texted\./);
+  assert.equal(s.Attention, 'None');
+});
+
+test('a seller alert text that never arrived: "Seller texted" goes off', () => {
+  const s = summarizeCall({ Real_Address: 'A', Prop_ID: 'P', Call_Disposition: 'Transferred to Seller', Seller_SMS_Sent: true, SMS_Sent: true,
+    Notes: '[TEXT NOT DELIVERED 11/19/2026, 5:11:00 PM]: (seller) landline or unreachable carrier (Twilio error 30006) - the text to the seller (786-555-0123) did not arrive. SM2' });
+  assert.equal(s['Seller texted'], false); assert.equal(s['Caller texted'], true); assert.match(s['What happened'], /Text to the seller was not delivered/);
+});
+
+test('an auto-reply whose contact text never arrived is flagged Needs you (it was marked handled before)', () => {
+  const base = { Real_Address: 'A', Prop_ID: 'P', Voicemail_URL: 'u', SMS_Sent: true, Notes: '[AUTO REPLY 11/19/2026, 9:00:00 AM]: x\n[TEXT NOT DELIVERED 11/19/2026, 9:00:20 AM]: (auto) phone off or unreachable (Twilio error 30003) - the text to the caller (305-555-0601) did not arrive. SM3' };
+  const s = summarizeCall(base);
+  assert.equal(s.Attention, 'Needs you'); assert.match(s['Action needed'], /contact text was NOT delivered \(phone off or unreachable\) - reach the caller another way/);
+  assert.equal(summarizeCall({ ...base, Handled: true }).Attention, 'None');
 });
 
 test('changedFields writes only what is different (a re-run writes nothing)', () => {

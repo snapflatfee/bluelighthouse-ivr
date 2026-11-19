@@ -285,6 +285,14 @@ Found with 941-564-9874: replied "Stop" on 11/18, then called 6 more times; each
 - Not covered: seller lead-alert texts to a seller who replied STOP (those numbers are not in CALL LOG; Twilio blocks them and `notifySeller` logs the error).
 - Dashboard Messages tab: outgoing messages with status failed/undelivered now show a red "✕ not delivered" instead of ⏳.
 
+### Delivery results — did the text actually arrive? (added 2026-11-19)
+Twilio "accepting" a text only means it was queued; a landline (e.g. 480-631-2856) shows `SMS_Sent` true but never receives it. Every text we send now carries `statusCallback` = `BASE_URL/sms-status?kind=caller|auto|seller&logId=…` (`smsStatusCallback()`), and `POST /sms-status` handles Twilio's report (signature-checked like every POST):
+- Only `failed` / `undelivered` matter. The handler appends `[TEXT NOT DELIVERED time]: (kind) reason (Twilio error N) - the text to the caller|seller (xxx-xxx-xxxx) did not arrive. SID` to Notes (same SID never twice) and turns `SMS_Sent` (caller/auto) or `Seller_SMS_Sent` (seller) off. `lib/smsErrors.js` (`smsErrorText`) gives plain words: 30006 landline or unreachable carrier · 30003 phone off or unreachable · 30005 unknown or inactive number · 30007 filtered by the carrier · 30034 our number not registered (A2P) · 21610 the person replied STOP · 21614 not a mobile number…
+- `lib/callSummary.js` derives from that Notes line (so a race with the `SMS_Sent` write can't matter): `Caller texted` / `Seller texted` go off, and the sentence says "Text to the caller was not delivered (landline or unreachable carrier)."
+- **An auto-reply whose contact text never arrives is flagged Needs you again** ("The seller's contact text was NOT delivered (…) - reach the caller another way"), because that call had been marked handled.
+- Only texts sent from now on are tracked; earlier failures are not back-filled. Needs `BASE_URL` set (it is).
+- Manager Dashboard: the Messages tab now shows the reason and Twilio code next to a failed text ("✕ not delivered · landline or unreachable carrier (30006)"); `lib/smsErrors.js` there is a copy of this list — keep the two the same.
+
 ### Auto-reply with the seller's contact for unmatched callers (added 2026-11-19, Jorge)
 Many "address not found" callers leave a voicemail or text back **with** the address. Instead of flagging every one as *Needs you*, `tryAutoReply(logId, text, via)` (server.js, next to `sendCallerSms`) looks for a listed property in that text and, if found, texts the caller the seller's contact by itself.
 - **Triggers:** `/voicemail-transcribed` (transcript of an unmatched call; not commission/seller-unavailable branches, **not Spanish** because the English-only transcript is unreliable) and `/sms-inbound` (the caller's text reply on their latest CALL LOG row).

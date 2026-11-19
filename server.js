@@ -77,6 +77,34 @@ app.use('/audio', express.static(path.join(__dirname, 'audio')));
 // Messages tab (separate repo with its own login) — removed here 2026-10-15
 // because it was publicly reachable with no auth.
 
+// ─── DELIVERY RESULT of a text we sent (Twilio statusCallback) ───────────────
+// Only failed/undelivered matter. Writes "[TEXT NOT DELIVERED time]: (kind) reason (Twilio error N) SID" to Notes
+// (lib/callSummary.js reads it: "Caller texted" / "Seller texted" go off, and a failed auto-reply is flagged) and
+// turns the old checkbox off. The same SID is never recorded twice (Twilio may call more than once).
+app.post('/sms-status', async (req, res) => {
+  res.sendStatus(200);                                       // answer Twilio at once; the work below is best-effort
+  try {
+    const status = String(req.body.MessageStatus || req.body.SmsStatus || '').toLowerCase();
+    const sid    = String(req.body.MessageSid || req.body.SmsSid || '');
+    const logId  = String(req.query.logId || '');
+    const kind   = ['caller', 'auto', 'seller'].includes(req.query.kind) ? req.query.kind : 'caller';
+    if (!logId || !/^(failed|undelivered)$/.test(status)) return;
+    const rec = await base('CALL LOG').find(logId);
+    const cur = rec.get('Notes') || '';
+    if (sid && cur.includes(sid)) return;
+    const code = String(req.body.ErrorCode || '').replace(/\D/g, '');
+    const why  = smsErrorText(code);
+    const who  = kind === 'seller' ? 'seller' : 'caller';
+    const when = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+    await base('CALL LOG').update(logId, {
+      Notes: `${cur ? `${cur}\n` : ''}[TEXT NOT DELIVERED ${when}]: (${kind}) ${why}${code && !/^Twilio error/.test(why) ? ` (Twilio error ${code})` : ''} - the text to the ${who}${req.body.To ? ` (${prettyPhone(req.body.To)})` : ''} did not arrive. ${sid}`.trim(),
+      ...(kind === 'seller' ? { Seller_SMS_Sent: false } : { SMS_Sent: false }),
+    });
+    console.log(`text not delivered: ${kind} text on ${logId} (${status}, error ${code || '?'} — ${why})`);
+    await updateCallSummary(logId);
+  } catch (e) { console.error('sms-status failed:', e.message || e); }
+});
+
 // ─── INBOUND SMS — replies from callers/sellers ──────────────────────────────
 app.post('/sms-inbound', async (req, res) => {
   const from = req.body.From || '';
@@ -117,6 +145,7 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 const base          = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);
 const claude        = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const { summarizeCall, changedFields, isStopText, isStartText } = require('./lib/callSummary');
+const { smsErrorText } = require('./lib/smsErrors');
 
 // ─── Email via Resend (Railway blocks SMTP port 587 — use HTTP API instead) ──
 // Sign up free at resend.com, get API key, add RESEND_API_KEY to Railway env vars
@@ -486,6 +515,13 @@ async function callerOptedOut(to) {
     return false;
   }
 }
+// ─── DELIVERY RESULTS (added 2026-11-19) ─────────────────────────────────────
+// Twilio "accepting" a text only means it was queued. Each text now carries a statusCallback so Twilio tells us the
+// final result; /sms-status (below) records failures on the call row (SMS_Sent / Seller_SMS_Sent off + a Notes line).
+// kind = caller (post-call text) | auto (seller-contact auto-reply) | seller (lead alert).
+const smsStatusCallback = (kind, logId) => (logId && process.env.BASE_URL
+  ? { statusCallback: `${process.env.BASE_URL.replace(/\/+$/, '')}/sms-status?kind=${kind}&logId=${encodeURIComponent(logId)}` } : {});
+
 async function noteOptOut(logId, to) {
   console.log(`Caller SMS not sent: ${to} has opted out (STOP)`);
   if (!logId) return;
@@ -508,7 +544,8 @@ async function sendCallerSms({ to, lang, listing, fullAddr, transferred, autoRep
   recentCallerSms.set(key, Date.now());
   if (recentCallerSms.size > 1000) recentCallerSms.delete(recentCallerSms.keys().next().value);
   try {
-    await twilioClient.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to, body: callerSmsBody({ lang, listing, fullAddr, transferred, autoReply }) });
+    await twilioClient.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to, body: callerSmsBody({ lang, listing, fullAddr, transferred, autoReply }),
+      ...smsStatusCallback(autoReply ? 'auto' : 'caller', logId) });
     return true;
   } catch (e) {
     console.error('Caller SMS error:', e.message);
@@ -564,7 +601,7 @@ async function tryAutoReply(logId, text, via) {
     // The seller is alerted exactly as for any other matched call (email always; text only with SMS_Recording_Consent),
     // with the caller's number and carrier name, so they know someone has their contact and may call or text.
     try {
-      const alert = await notifySeller({ record: listing, callerNumber: to, callerName: f.Caller_Name || '', callerType: f.Caller_Type || 'Buyer',
+      const alert = await notifySeller({ record: listing, logId, callerNumber: to, callerName: f.Caller_Name || '', callerType: f.Caller_Type || 'Buyer',
         address: listing.get('Address') || listing.get('Street Address') || '', city: listing.get('City') || '' });
       const upd = { ...(alert.sms ? { Seller_SMS_Sent: true } : {}), ...(alert.email ? { 'Seller emailed': true } : {}) };
       if (Object.keys(upd).length) await base('CALL LOG').update(logId, upd);
@@ -634,7 +671,7 @@ async function postCallSends(logId, { callerOnly = false } = {}) {
 
     // Seller notification (email always + SMS if consent)
     if (listing && !callerOnly) {
-      const sent = await notifySeller({ record: listing, callerNumber, callerName, callerType, address, city });
+      const sent = await notifySeller({ record: listing, logId, callerNumber, callerName, callerType, address, city });
       const upd = { ...(sent.sms ? { Seller_SMS_Sent: true } : {}), ...(sent.email ? { 'Seller emailed': true } : {}) };
       if (Object.keys(upd).length) await base('CALL LOG').update(logId, upd).catch(console.error);
     }
@@ -1932,7 +1969,7 @@ app.post('/fallback-sms-choice', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // NOTIFY SELLER helper
 // ═══════════════════════════════════════════════════════════════════════════════
-async function notifySeller({ record, callerNumber, callerName = '', callerType, address, city }) {
+async function notifySeller({ record, logId = '', callerNumber, callerName = '', callerType, address, city }) {
   const sellerEmail    = record.get('Email');
   const sellerPhone    = record.get('Phone');
   const sellerName     = record.get('Name') || 'Seller';
@@ -1963,6 +2000,7 @@ async function notifySeller({ record, callerNumber, callerName = '', callerType,
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER, to: smsTo,
       body: `Lead alert from SnapFlatFee.com. Call received inquiring about your property: ${where}. From a ${callerLabelSMS}. Caller's number: ${prettyPhone(callerNumber)}${callerName ? ` (${callerName})` : ''}.\n\nAttn: Jorge Zea - Broker - Realtor Msg & data rates may apply. Reply STOP to opt out.`,
+      ...smsStatusCallback('seller', logId),
     }).then(() => { smsSent = true; }).catch((e) => console.error('Seller SMS error:', e.message));
     return { sms: smsSent, email: emailSent };
   }
