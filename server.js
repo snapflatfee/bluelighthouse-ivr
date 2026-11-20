@@ -462,13 +462,12 @@ function callerSmsBody({ lang, listing, fullAddr, transferred, autoReply = false
   const EN_TAIL = '\n\nMsg & data rates may apply. Reply STOP to opt out.';
   const ES_TAIL = '\n\nTarifas pueden aplicar. Responda STOP para cancelar.';
   if (listing && autoReply) {
-    // The caller gave us the property address (voicemail or text) and it matched a listing: send the seller's contact.
+    // The caller gave us the property address (voicemail or text) and it matched a listing: send the seller's PHONE
+    // (2026-11-20, Jorge: texts carry phone numbers only, never an email address).
     const isRent = /rent|lease|alquil/i.test((listing.get('Type') || '').toString());
     const ph = prettyPhone((listing.get('Phone') || '').toString().trim());
-    const em = (listing.get('Email') || '').toString().trim();
-    const contact = [ph && `Phone: ${ph}`, em && `Email: ${em}`].filter(Boolean).join('. ');
-    const en = `Thanks for your message about ${fullAddr}. ${isRent ? 'Landlord' : 'Seller'} contact: ${contact}. We are available to answer any questions, just text us back.${EN_TAIL}`;
-    const es = `Gracias por su mensaje sobre ${fullAddr}. Contacto de ${isRent ? 'el propietario' : 'el vendedor'}: ${contact}. Estamos a su disposicion para cualquier pregunta, solo responda a este texto.${ES_TAIL}`;
+    const en = `Thanks for your message, ref: ${fullAddr}. Please contact the ${isRent ? 'landlord' : 'seller'} directly at ${ph}.${EN_TAIL}`;
+    const es = `Gracias por su mensaje, ref: ${fullAddr}. Por favor contacte directamente ${isRent ? 'al propietario' : 'al vendedor'} al ${ph}.${ES_TAIL}`;
     return lang === 'es' ? es : lang === 'en' ? en : `${en}\n\n${es}`;
   }
   if (!listing) {
@@ -480,17 +479,20 @@ function callerSmsBody({ lang, listing, fullAddr, transferred, autoReply = false
   }
   const isRental = /rent|lease|alquil/i.test((listing.get('Type') || '').toString());
   const phone = prettyPhone((listing.get('Phone') || '').toString().trim());
-  const email = (listing.get('Email') || '').toString().trim();
-  const contactEN = [phone && `Phone: ${phone}`, email && `Email: ${email}`].filter(Boolean).join('. ');
-  const partyEN = isRental ? 'Landlord' : 'Seller';
-  const partyES = isRental ? 'el propietario' : 'el vendedor';
+  const partyEN = isRental ? 'landlord' : 'seller';
+  const partyES = isRental ? 'al propietario' : 'al vendedor';
+  // 2026-11-20 (Jorge): when the caller was handed to the seller, the text is just the address and the seller's PHONE
+  // (no email, no office intro). With no phone on file it falls back to the plain "text us back" line.
+  if (transferred && phone) {
+    return lang === 'es'
+      ? `Gracias por llamar, ref: ${fullAddr}. Si no logro comunicarse, por favor contacte directamente ${partyES} al ${phone}.${ES_TAIL}`
+      : `Thanks for calling, ref: ${fullAddr}. If you couldn't connect, please contact the ${partyEN} directly at ${phone}.${EN_TAIL}`;
+  }
   if (lang === 'es') {
     return `Gracias por llamar a la oficina de Jorge Zea (Corredor). Ref: ${fullAddr}.` +
-      (transferred && contactEN ? ` Por si no logro comunicarse con ${partyES}: ${contactEN}.` : '') +
       ` Estamos a su disposicion para cualquier pregunta, solo responda a este texto.${ES_TAIL}`;
   }
   return `Thanks for calling the Office of Jorge Zea (Broker). Ref: ${fullAddr}.` +
-    (transferred && contactEN ? ` In case you couldn't connect with the ${partyEN}: ${contactEN}.` : '') +
     ` We are available to answer any questions, just text us back.${EN_TAIL}`;
 }
 
@@ -582,7 +584,7 @@ async function tryAutoReply(logId, text, via) {
 
     const listings = (await fetchListings()).filter(isLive);
     const match = findMatchInText(listings, text);
-    if (!match || !(match.phone || match.email)) return false;                                   // no address / not found / no contact
+    if (!match || !toE164(match.phone)) return false;                                            // no address / not found / no PHONE on the listing (texts never carry an email)
 
     const listing = await base('ALL LISTINGS').find(match.id);
     const fullAddr = tidyAddress(listing.get('Address') || listing.get('Street Address') || '', listing.get('City'), listing.get('State'), listing.get('Zip code'));
